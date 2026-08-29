@@ -176,6 +176,67 @@ tryNarrowArrayInjectChain(Value feeder, llhd::SignalOp sigOp) {
   return narrowed;
 }
 
+/// The struct counterpart of `tryNarrowArrayInjectChain`, for the single most
+/// common shape in struct-heavy RTL: an `always_comb` that assigns a default
+/// to a packed struct and then overrides individual fields, which elaborates
+/// into a chain of `hw.struct_inject`s over a shared `llhd.prb %sigOp`.
+///
+/// CVA6's `load_unit.req_port_o` is the motivating case. It is a 117-bit
+/// struct with EIGHT drives: seven per-field ones (`data_we`, `data_wdata`,
+/// `cbo_op`, ...) and one whole-struct drive whose feeder is a mux tree over
+/// `struct_inject` chains touching only `data_req`, `kill_req`, `tag_valid`,
+/// `data_be`, `data_size` and `valid`. Those two sets are disjoint, but the
+/// whole-struct drive is reported at full width, so all eight collide and the
+/// signal is refused. Narrowing it to the six injected fields makes the
+/// already-true disjointness visible to the interval algorithm.
+///
+/// FIELD OFFSETS ARE THE OPPOSITE OF ARRAY OFFSETS. Measured against
+/// `hw-aggregate-to-comb`, which is what actually flattens these types:
+/// `!hw.struct<a:i2, b:i6, c:i4>` bitcast from an i12 puts `a` at bit 10, `b`
+/// at 4 and `c` at 0 -- the FIRST field occupies the HIGH bits, while array
+/// element 0 occupies the LOW bits. So a field's offset is the summed width
+/// of the fields AFTER it. Do not "simplify" this to match the array case.
+static std::optional<SmallVector<NarrowedWrite>>
+tryNarrowStructInjectChain(Value feeder, llhd::SignalOp sigOp) {
+  SmallVector<NarrowedWrite> narrowed;
+  Value cur = feeder;
+  while (auto injectOp = cur.getDefiningOp<hw::StructInjectOp>()) {
+    auto structTy = hw::type_cast<hw::StructType>(injectOp.getInput().getType());
+    auto index = structTy.getFieldIndex(injectOp.getFieldNameAttr());
+    if (!index)
+      return std::nullopt;
+
+    auto elements = structTy.getElements();
+    auto fieldBw = hw::getBitWidth(elements[*index].type);
+    if (fieldBw <= 0)
+      return std::nullopt;
+
+    uint64_t offset = 0;
+    for (size_t i = *index + 1, e = elements.size(); i < e; ++i) {
+      auto bw = hw::getBitWidth(elements[i].type);
+      if (bw < 0)
+        return std::nullopt;
+      offset += bw;
+    }
+
+    narrowed.push_back({offset, static_cast<uint64_t>(fieldBw)});
+    cur = injectOp.getInput();
+  }
+
+  if (narrowed.empty())
+    return std::nullopt;
+
+  // Same base requirement as the array case: the chain has to bottom out at a
+  // probe of THIS signal, which is what makes every untouched field a faithful
+  // pass-through that `preVal` already accounts for. A chain over anything
+  // else is writing a genuinely new value and must keep its full width.
+  auto probeOp = cur.getDefiningOp<llhd::ProbeOp>();
+  if (!probeOp || probeOp.getSignal() != sigOp.getResult())
+    return std::nullopt;
+
+  return narrowed;
+}
+
 /// The bit-vector counterpart of `tryNarrowArrayInjectChain`, for a
 /// non-aggregate (plain integer) signal: `Deseq` represents a per-position
 /// clocked bitfield write as `comb.concat(..., <new bits>, ...)` where the
@@ -272,6 +333,8 @@ tryNarrowFeeder(Value feeder, llhd::SignalOp sigOp, Value selfFeedback,
       return SmallVector<NarrowedWrite>{};
 
   if (auto narrowed = tryNarrowArrayInjectChain(feeder, sigOp))
+    return narrowed;
+  if (auto narrowed = tryNarrowStructInjectChain(feeder, sigOp))
     return narrowed;
   if (auto narrowed = tryNarrowBitConcatChain(feeder, sigOp))
     return narrowed;
@@ -480,6 +543,42 @@ public:
                             << narrowed->size() << " range(s)\n";
                       }
                     });
+                    // A struct-typed drive can only be sliced back apart with
+                    // `hw.struct_extract`, which addresses a FIELD, not a bit
+                    // range -- so every narrowed range has to land exactly on
+                    // one field. It normally does (each came from a
+                    // struct_inject of one field), but `tryNarrowFeeder`'s mux
+                    // union coalesces adjacent ranges into a hull, and a hull
+                    // spanning two fields has no single field to name. Resolve
+                    // the field names up front and abandon the whole narrowing
+                    // if any range fails to match, rather than building an
+                    // invalid `comb.extract` on a struct.
+                    auto structTy = hw::type_dyn_cast<hw::StructType>(
+                        driveOp.getValue().getType());
+                    SmallVector<StringAttr> fieldNames;
+                    if (narrowed && structTy) {
+                      auto elements = structTy.getElements();
+                      for (auto &write : *narrowed) {
+                        uint64_t offset = hw::getBitWidth(structTy);
+                        StringAttr match;
+                        for (auto &element : elements) {
+                          auto fieldBw = hw::getBitWidth(element.type);
+                          if (fieldBw < 0)
+                            break;
+                          offset -= fieldBw;
+                          if (offset == write.bitOffset &&
+                              (uint64_t)fieldBw == write.bitwidth) {
+                            match = element.name;
+                            break;
+                          }
+                        }
+                        if (!match) {
+                          narrowed = std::nullopt;
+                          break;
+                        }
+                        fieldNames.push_back(match);
+                      }
+                    }
                     if (narrowed) {
                       bool isArray = isa<hw::ArrayType>(driveOp.getValue().getType());
                       auto arrayTy = isArray ? cast<hw::ArrayType>(
@@ -488,9 +587,13 @@ public:
                       uint64_t elemBw =
                           isArray ? hw::getBitWidth(arrayTy.getElementType()) : 0;
                       OpBuilder b(driveOp);
-                      for (auto &write : *narrowed) {
+                      for (auto [writeIdx, write] : llvm::enumerate(*narrowed)) {
                         Value elem;
-                        if (isArray) {
+                        if (structTy) {
+                          elem = hw::StructExtractOp::create(
+                              b, driveOp.getLoc(), driveOp.getValue(),
+                              fieldNames[writeIdx]);
+                        } else if (isArray) {
                           uint64_t index = write.bitOffset / elemBw;
                           Value idx = hw::ConstantOp::create(
                               b, driveOp.getLoc(),
@@ -544,6 +647,81 @@ public:
                   stack.emplace_back(
                       user, Offset(offset.min, offset.max + bw - 1, indices));
 
+                return success();
+              })
+              // The three remaining ways to alias a signal. Without these a
+              // signal reached through a struct field or an array element is
+              // simply not promotable, which on CVA6 was 148 ops across 20
+              // modules -- every one of them ordinary RTL writing one field
+              // of a packed struct.
+              //
+              // BIT LAYOUT, MEASURED not assumed. `hw-aggregate-to-comb` is
+              // the authority, because it is what actually flattens these
+              // types later, and the two conventions are OPPOSITE:
+              //
+              //   !hw.array<2xi4> from i8   -> element 0 at bit 0 (LOW)
+              //   !hw.struct<a:i2,b:i6,c:i4>
+              //        from i12            -> a at bit 10, b at 4, c at 0,
+              //                               i.e. the FIRST field is HIGH
+              //
+              // so a struct field's offset is the total width of the fields
+              // AFTER it. Guessing this symmetric would have been wrong, and
+              // an offset bug here is a silent miscompilation -- see the
+              // array-offset note on tryNarrowArrayInjectChain above, which
+              // is exactly that bug, found by a d2 equivalence check.
+              .Case<llhd::SigStructExtractOp>(
+                  [&](llhd::SigStructExtractOp structOp) {
+                    if (!offset.isStatic())
+                      return failure();
+                    auto structTy = hw::type_cast<hw::StructType>(
+                        cast<llhd::RefType>(structOp.getInput().getType())
+                            .getNestedType());
+                    auto index = structTy.getFieldIndex(structOp.getFieldAttr());
+                    if (!index)
+                      return failure();
+                    auto elements = structTy.getElements();
+                    uint64_t below = 0;
+                    for (size_t i = *index + 1, e = elements.size(); i < e; ++i) {
+                      auto bw = hw::getBitWidth(elements[i].type);
+                      if (bw < 0)
+                        return failure();
+                      below += bw;
+                    }
+                    for (auto *user : structOp->getUsers())
+                      stack.emplace_back(user, Offset(offset.min + below));
+                    return success();
+                  })
+              .Case<llhd::SigArrayGetOp>([&](llhd::SigArrayGetOp getOp) {
+                auto constIdx = getOp.getIndex().getDefiningOp<hw::ConstantOp>();
+                if (!constIdx || !offset.isStatic())
+                  return failure();
+                auto arrayTy = hw::type_cast<hw::ArrayType>(
+                    cast<llhd::RefType>(getOp.getInput().getType())
+                        .getNestedType());
+                auto elemBw = hw::getBitWidth(arrayTy.getElementType());
+                if (elemBw <= 0)
+                  return failure();
+                uint64_t elemOffset =
+                    constIdx.getValue().getZExtValue() * (uint64_t)elemBw;
+                for (auto *user : getOp->getUsers())
+                  stack.emplace_back(user, Offset(offset.min + elemOffset));
+                return success();
+              })
+              .Case<llhd::SigArraySliceOp>([&](llhd::SigArraySliceOp sliceOp) {
+                auto constIdx =
+                    sliceOp.getLowIndex().getDefiningOp<hw::ConstantOp>();
+                if (!constIdx || !offset.isStatic())
+                  return failure();
+                auto arrayTy = hw::type_cast<hw::ArrayType>(
+                    cast<llhd::RefType>(sliceOp.getInput().getType())
+                        .getNestedType());
+                auto elemBw = hw::getBitWidth(arrayTy.getElementType());
+                if (elemBw <= 0)
+                  return failure();
+                uint64_t elemOffset =
+                    constIdx.getValue().getZExtValue() * (uint64_t)elemBw;
+                for (auto *user : sliceOp->getUsers())
+                  stack.emplace_back(user, Offset(offset.min + elemOffset));
                 return success();
               })
               .Default([](auto *op) {
