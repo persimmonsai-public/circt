@@ -444,6 +444,15 @@ bool Deseq::analyzeProcess() {
     for (auto value : wait.getObserved())
       triggers.insert(getValueField(value));
   } else {
+    // A non-i1 observed value does not stop the directly observed i1 values
+    // from being triggers in their own right -- an `always @(posedge clk or
+    // negedge rst_b)` whose clock arrives concatenated still observes rst_b
+    // plainly. Without this the reset is dropped and the process ends up with
+    // too few triggers to lower.
+    for (auto value : wait.getObserved())
+      if (value.getType().isSignlessInteger(1))
+        triggers.insert(getValueField(value));
+
     // Projected clock case: find i1 dest operands that are projections of
     // observed values. These become our triggers.
     for (auto operand : wait.getDestOperands()) {
@@ -453,6 +462,27 @@ bool Deseq::analyzeProcess() {
       // Check if this is a projection (fieldID != 0) of an observed value.
       if (vf.fieldID != 0 && llvm::is_contained(wait.getObserved(), vf.value)) {
         triggers.insert(vf);
+        continue;
+      }
+      // Mirror of the projection case: the observed value may instead be an
+      // aggregate BUILT FROM this operand rather than the operand being a
+      // projection of it. OpenC910 gates each FIFO entry with its own clock
+      // and the frontend observes them concatenated:
+      //
+      //   %3 = comb.concat %clk_out_1, %clk_out_0 : i1, i1
+      //   llhd.wait yield (...), (%3, %rst_b : i2, i1), ^bb2(%clk_out_0, %rst_b)
+      //
+      // Observing the aggregate means a change to any of its operands wakes
+      // the process, so an operand passed on to the body is as legitimate a
+      // trigger as a projection would be.
+      for (auto observed : wait.getObserved()) {
+        auto *defOp = observed.getDefiningOp();
+        if (!defOp || !isa<comb::ConcatOp, hw::ArrayCreateOp>(defOp))
+          continue;
+        if (llvm::is_contained(defOp->getOperands(), operand)) {
+          triggers.insert(vf);
+          break;
+        }
       }
     }
   }
