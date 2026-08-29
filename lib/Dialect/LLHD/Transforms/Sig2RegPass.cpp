@@ -253,6 +253,24 @@ tryNarrowFeeder(Value feeder, llhd::SignalOp sigOp, Value selfFeedback,
                 unsigned depth = 0) {
   feeder = unwrapClockEnable(feeder, selfFeedback);
 
+  // A feeder that is exactly a probe of the signal being driven is a pure
+  // hold: it writes nothing. Without this the arm poisons the whole mux
+  // union below and the drive falls back to full width, which is what made
+  // two drives of DISJOINT bits look identical. OpenC910's `ct_fifo` writes
+  // one bit of a 2-bit valid vector per entry and expresses "no write this
+  // cycle" exactly this way:
+  //
+  //     %38 = comb.mux %34, %35, %37
+  //       %35 = comb.concat %32, %true        // bit 0 written
+  //       %37 = comb.mux %36, %33, %70
+  //          %70 = llhd.prb %fifo_entry_vld   // <- writes nothing
+  //
+  // Restricted to a probe of THIS signal; a probe of any other signal is a
+  // real value being written and must keep its full-width interval.
+  if (auto probeOp = feeder.getDefiningOp<llhd::ProbeOp>())
+    if (probeOp.getSignal() == sigOp.getResult())
+      return SmallVector<NarrowedWrite>{};
+
   if (auto narrowed = tryNarrowArrayInjectChain(feeder, sigOp))
     return narrowed;
   if (auto narrowed = tryNarrowBitConcatChain(feeder, sigOp))
@@ -275,6 +293,13 @@ tryNarrowFeeder(Value feeder, llhd::SignalOp sigOp, Value selfFeedback,
   auto rhs = tryNarrowFeeder(muxOp.getFalseValue(), sigOp, selfFeedback,
                              depth + 1);
   if (!rhs)
+    return std::nullopt;
+
+  // An empty union means the drive provably writes nothing at all. Rather
+  // than emit zero intervals -- which would drop the drive and silently
+  // remove logic, a failure mode this project has had to retract twice --
+  // fall back to the conservative full-width answer.
+  if (lhs->empty() && rhs->empty())
     return std::nullopt;
 
   SmallVector<NarrowedWrite> merged(*lhs);
