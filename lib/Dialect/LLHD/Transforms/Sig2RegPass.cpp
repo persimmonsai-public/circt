@@ -221,6 +221,83 @@ tryNarrowBitConcatChain(Value feeder, llhd::SignalOp sigOp) {
   return narrowed;
 }
 
+/// Narrow a drive's feeder to the bit ranges it actually writes, looking
+/// through mux trees.
+///
+/// `tryNarrowArrayInjectChain`/`tryNarrowBitConcatChain` each require the
+/// pass-through shape to sit DIRECTLY on the feeder. That covers the case
+/// where the hold path is a clock-enable self-feedback mux, which
+/// `unwrapClockEnable` peels first. It does not cover RTL that expresses the
+/// hold by re-injecting into the signal's own probe on every arm, which is
+/// what OpenC910's per-entry gated-clock register banks do:
+///
+///     %58 = comb.mux %57, %53, %55                  // no self-feedback arm
+///     %53 = hw.array_inject %74[%false], %52        // element 0
+///     %55 = comb.mux %54, %51, %50                  // ... also element 0
+///
+/// Every leaf writes the same element, so the drive's real interval is that
+/// element -- but with a mux on top neither helper matches and the drive is
+/// reported at full width, which then makes two sibling drives of disjoint
+/// elements look like they collide. That rejected 65 signals on OpenC910 and
+/// blackboxed 55 modules.
+///
+/// Recursing into both arms and unioning is sound because the union is an
+/// upper bound on what either arm writes, and the caller reconstructs each
+/// range from the register's own RESULT -- whichever arm fired, the result
+/// holds the value that range ended up with. Any arm that cannot be narrowed
+/// forces the whole feeder back to full width, and overlapping-but-unequal
+/// ranges are refused outright rather than merged, keeping this a pure
+/// narrowing of the existing conservative answer.
+static std::optional<SmallVector<NarrowedWrite>>
+tryNarrowFeeder(Value feeder, llhd::SignalOp sigOp, Value selfFeedback,
+                unsigned depth = 0) {
+  feeder = unwrapClockEnable(feeder, selfFeedback);
+
+  if (auto narrowed = tryNarrowArrayInjectChain(feeder, sigOp))
+    return narrowed;
+  if (auto narrowed = tryNarrowBitConcatChain(feeder, sigOp))
+    return narrowed;
+
+  // Bound the recursion: these mux trees are shallow in practice, and a cap
+  // keeps a pathological input from costing more than the promotion is worth.
+  static constexpr unsigned kMaxMuxDepth = 8;
+  if (depth >= kMaxMuxDepth)
+    return std::nullopt;
+
+  auto muxOp = feeder.getDefiningOp<comb::MuxOp>();
+  if (!muxOp)
+    return std::nullopt;
+
+  auto lhs = tryNarrowFeeder(muxOp.getTrueValue(), sigOp, selfFeedback,
+                             depth + 1);
+  if (!lhs)
+    return std::nullopt;
+  auto rhs = tryNarrowFeeder(muxOp.getFalseValue(), sigOp, selfFeedback,
+                             depth + 1);
+  if (!rhs)
+    return std::nullopt;
+
+  SmallVector<NarrowedWrite> merged(*lhs);
+  for (const auto &w : *rhs) {
+    bool identical = false;
+    for (const auto &have : merged) {
+      if (have.bitOffset == w.bitOffset && have.bitwidth == w.bitwidth) {
+        identical = true;
+        break;
+      }
+      // Partial overlap between arms would need a real range union to stay
+      // correct; refuse instead, which just falls back to full width.
+      uint64_t haveEnd = have.bitOffset + have.bitwidth;
+      uint64_t wEnd = w.bitOffset + w.bitwidth;
+      if (have.bitOffset < wEnd && w.bitOffset < haveEnd)
+        return std::nullopt;
+    }
+    if (!identical)
+      merged.push_back(w);
+  }
+  return merged;
+}
+
 class SigPromoter {
 public:
   SigPromoter(llhd::SignalOp sigOp) : sigOp(sigOp) {}
@@ -309,11 +386,8 @@ public:
                 if (offset.isStatic() && offset.min == 0) {
                   if (auto firregOp =
                           driveOp.getValue().getDefiningOp<seq::FirRegOp>()) {
-                    Value feeder =
-                        unwrapClockEnable(firregOp.getNext(), firregOp.getResult());
-                    auto narrowed = tryNarrowArrayInjectChain(feeder, sigOp);
-                    if (!narrowed)
-                      narrowed = tryNarrowBitConcatChain(feeder, sigOp);
+                    auto narrowed = tryNarrowFeeder(firregOp.getNext(), sigOp,
+                                                    firregOp.getResult());
                     if (narrowed) {
                       bool isArray = isa<hw::ArrayType>(driveOp.getValue().getType());
                       auto arrayTy = isArray ? cast<hw::ArrayType>(

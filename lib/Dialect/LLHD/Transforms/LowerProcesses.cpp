@@ -31,7 +31,9 @@ using llvm::SmallSetVector;
 
 namespace {
 struct Lowering {
-  Lowering(ProcessOp processOp) : processOp(processOp) {}
+  Lowering(ProcessOp processOp, bool assumeCompleteSensitivity)
+      : processOp(processOp),
+        assumeCompleteSensitivity(assumeCompleteSensitivity) {}
   void lower();
   bool matchControlFlow();
   void markObservedValues();
@@ -42,6 +44,8 @@ struct Lowering {
   bool checkNoValuesLiveAcrossWait();
 
   ProcessOp processOp;
+  /// See the pass option of the same name.
+  bool assumeCompleteSensitivity;
   WaitOp waitOp;
   /// Set when the process is combinational but does not have the shape where
   /// entry and wait converge. See `canReRootAtWaitDest`.
@@ -55,7 +59,10 @@ void Lowering::lower() {
   if (!matchControlFlow())
     return;
   markObservedValues();
-  if (!allOperandsObserved())
+  // An incomplete sensitivity list means the process does not re-evaluate on
+  // every value it reads. Synthesis reads that as combinational logic anyway;
+  // simulation does not. Only skip the check when the caller has opted in.
+  if (!assumeCompleteSensitivity && !allOperandsObserved())
     return;
   LLVM_DEBUG(llvm::dbgs() << "Lowering process " << processOp.getLoc() << "\n");
 
@@ -411,6 +418,7 @@ bool Lowering::isObserved(Value value) {
 namespace {
 struct LowerProcessesPass
     : public llhd::impl::LowerProcessesPassBase<LowerProcessesPass> {
+  using LowerProcessesPassBase::LowerProcessesPassBase;
   void runOnOperation() override;
 };
 } // namespace
@@ -418,5 +426,5 @@ struct LowerProcessesPass
 void LowerProcessesPass::runOnOperation() {
   SmallVector<ProcessOp> processOps(getOperation().getOps<ProcessOp>());
   for (auto processOp : processOps)
-    Lowering(processOp).lower();
+    Lowering(processOp, assumeCompleteSensitivity).lower();
 }

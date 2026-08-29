@@ -54,6 +54,19 @@ def HoistSignalsPass : Pass<"llhd-hoist-signals"> {
 
 def LowerProcessesPass : Pass<"llhd-lower-processes", "hw::HWModuleOp"> {
   let summary = "Convert process ops to combinational ops where possible";
+  let options = [
+    Option<"assumeCompleteSensitivity", "assume-complete-sensitivity", "bool",
+           "false",
+           "Lower a process even when it reads values its wait does not "
+           "observe, i.e. when the RTL has an incomplete sensitivity list. "
+           "This is what synthesis tools do -- they infer combinational logic "
+           "from `always @(a or b)` regardless of what the list omits -- but "
+           "it diverges from simulation, where the process would not "
+           "re-evaluate on the omitted signal. Off by default; enable only in "
+           "a synthesis flow that accepts that reading. The structural checks "
+           "that distinguish combinational logic from a latch are unaffected "
+           "and still apply.">,
+  ];
 }
 
 def DeseqPass : Pass<"llhd-deseq", "hw::HWModuleOp"> {
