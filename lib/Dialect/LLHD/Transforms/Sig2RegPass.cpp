@@ -302,25 +302,44 @@ tryNarrowFeeder(Value feeder, llhd::SignalOp sigOp, Value selfFeedback,
   if (lhs->empty() && rhs->empty())
     return std::nullopt;
 
+  // Union the two arms' ranges, COALESCING ranges that overlap or touch into
+  // their hull. `NarrowedWrite` records only WHERE, and the caller rebuilds
+  // each range by extracting it back out of the register's own result, so
+  // widening a range to a hull can only move the answer toward the
+  // conservative full-width one -- never past it. It stays a narrowing
+  // because ranges separated by a real gap are kept apart.
+  //
+  // Refusing on any overlap (what this did before) was over-strict and cost
+  // real promotions. OpenC910's `ct_mmu_ptw.lsu_data_flop` is written by two
+  // sibling always blocks over DISJOINT slices, [58:0] and [63:59]. The
+  // [58:0] one is a mux tree whose arms write [0+59] (the whole slice, from
+  // `lsu_mmu_data`) and, in the cross-page-walk arms, [19+9] and [10+9] --
+  // both CONTAINED in [0+59], which is not a conflict at all. Bailing to full
+  // width there made the two disjoint drives look like they collide.
   SmallVector<NarrowedWrite> merged(*lhs);
-  for (const auto &w : *rhs) {
-    bool identical = false;
-    for (const auto &have : merged) {
-      if (have.bitOffset == w.bitOffset && have.bitwidth == w.bitwidth) {
-        identical = true;
-        break;
+  merged.append(rhs->begin(), rhs->end());
+  llvm::sort(merged, [](const NarrowedWrite &a, const NarrowedWrite &b) {
+    if (a.bitOffset != b.bitOffset)
+      return a.bitOffset < b.bitOffset;
+    return a.bitwidth < b.bitwidth;
+  });
+
+  SmallVector<NarrowedWrite> coalesced;
+  for (const auto &w : merged) {
+    if (!coalesced.empty()) {
+      NarrowedWrite &back = coalesced.back();
+      uint64_t backEnd = back.bitOffset + back.bitwidth;
+      // `<=` rather than `<`: adjacent ranges merge too. Sorted by offset, so
+      // `w.bitOffset >= back.bitOffset` and the hull starts at back's offset.
+      if (w.bitOffset <= backEnd) {
+        back.bitwidth =
+            std::max(backEnd, w.bitOffset + w.bitwidth) - back.bitOffset;
+        continue;
       }
-      // Partial overlap between arms would need a real range union to stay
-      // correct; refuse instead, which just falls back to full width.
-      uint64_t haveEnd = have.bitOffset + have.bitwidth;
-      uint64_t wEnd = w.bitOffset + w.bitwidth;
-      if (have.bitOffset < wEnd && w.bitOffset < haveEnd)
-        return std::nullopt;
     }
-    if (!identical)
-      merged.push_back(w);
+    coalesced.push_back(w);
   }
-  return merged;
+  return coalesced;
 }
 
 class SigPromoter {
