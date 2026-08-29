@@ -42,6 +42,7 @@ struct Lowering {
 
   bool canReRootAtWaitDest();
   bool checkNoValuesLiveAcrossWait();
+  bool isEdgeSensitive();
 
   ProcessOp processOp;
   /// See the pass option of the same name.
@@ -61,8 +62,12 @@ void Lowering::lower() {
   markObservedValues();
   // An incomplete sensitivity list means the process does not re-evaluate on
   // every value it reads. Synthesis reads that as combinational logic anyway;
-  // simulation does not. Only skip the check when the caller has opted in.
-  if (!assumeCompleteSensitivity && !allOperandsObserved())
+  // simulation does not. Only skip the check when the caller has opted in --
+  // AND the process is not edge-sensitive, because for a clocked process
+  // `allOperandsObserved` is the only thing left that distinguishes it from
+  // combinational logic, and lowering it as combinational DESTROYS its state.
+  if (!allOperandsObserved() &&
+      (!assumeCompleteSensitivity || isEdgeSensitive()))
     return;
   LLVM_DEBUG(llvm::dbgs() << "Lowering process " << processOp.getLoc() << "\n");
 
@@ -297,6 +302,40 @@ bool Lowering::canReRootAtWaitDest() {
     return false;
 
   return true;
+}
+
+/// Detect a process that samples an edge rather than a level.
+///
+/// The idiom is unmistakable in the IR: the wait passes its OWN observed
+/// values along as destination operands, so the destination block arguments
+/// hold those values as they were *before* the wait, and the body compares
+/// them against the current ones:
+///
+///     llhd.wait yield (...), (%clk_i, %rst_ni), ^bb2(%clk_i, %rst_ni)
+///   ^bb2(%prevClk: i1, %prevRst: i1):
+///     %a = comb.xor %prevClk, %true
+///     %b = comb.and %a, %clk_i        // !prev && cur  == posedge
+///
+/// A level-sensitive `always @(a or b)` has no reason to carry an observed
+/// value across the wait, so testing for the overlap separates the two
+/// cheaply and without pattern-matching the comparison itself.
+///
+/// This matters only under `assume-complete-sensitivity`. Normally a clocked
+/// process is rejected by `allOperandsObserved` (its body reads state that is
+/// not in the sensitivity list) and left for `Deseq`; the option disables
+/// exactly that check. CVA6 is where it showed: `Deseq` declines `tc_sram`'s
+/// memory-array process and `hwpf_stride`'s, and lowering them as
+/// combinational folded a 64x25 array to a constant and dropped 3 of 4
+/// registers (263 -> 260 design-wide). OpenC910 is unaffected either way
+/// (4,782 registers with and without), because its `Deseq` patch converts
+/// every clocked process before this pass runs.
+bool Lowering::isEdgeSensitive() {
+  SmallDenseSet<Value> observed(waitOp.getObserved().begin(),
+                                waitOp.getObserved().end());
+  for (auto operand : waitOp.getDestOperands())
+    if (observed.contains(operand))
+      return true;
+  return false;
 }
 
 /// Mark values the process observes that are defined outside the process.
