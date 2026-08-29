@@ -462,6 +462,24 @@ public:
                       selfFeedback = firregOp.getResult();
                     }
                     auto narrowed = tryNarrowFeeder(feeder, sigOp, selfFeedback);
+                    LLVM_DEBUG({
+                      if (narrowed) {
+                        auto parent =
+                            sigOp->getParentOfType<hw::HWModuleOp>();
+                        llvm::dbgs()
+                            << "  - narrowed "
+                            << (!firregOp ? "combinational"
+                                          : (firregOp.getNext() ==
+                                                     firregOp.getResult() &&
+                                             firregOp.getResetValue()
+                                                 ? "reset-value"
+                                                 : "next"))
+                            << " drive of @"
+                            << (parent ? parent.getModuleName() : "?") << "."
+                            << sigOp.getName().value_or("?") << " to "
+                            << narrowed->size() << " range(s)\n";
+                      }
+                    });
                     if (narrowed) {
                       bool isArray = isa<hw::ArrayType>(driveOp.getValue().getType());
                       auto arrayTy = isArray ? cast<hw::ArrayType>(
