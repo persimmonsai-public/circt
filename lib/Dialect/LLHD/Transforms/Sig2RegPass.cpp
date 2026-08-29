@@ -14,7 +14,9 @@
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/LLHD/LLHDOps.h"
 #include "circt/Dialect/LLHD/LLHDPasses.h"
+#include "circt/Dialect/Seq/SeqOps.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/MathExtras.h"
 
 #define DEBUG_TYPE "llhd-sig2reg"
 
@@ -53,8 +55,9 @@ struct Offset {
 /// read from. All values refer to number of bits, not elements.
 struct Interval {
   Interval(const Offset &low, uint64_t bitwidth, Value value,
-           llhd::TimeAttr delay = llhd::TimeAttr())
-      : low(low), bitwidth(bitwidth), value(value), delay(delay) {}
+           Block *block = nullptr, llhd::TimeAttr delay = llhd::TimeAttr())
+      : low(low), bitwidth(bitwidth), value(value), block(block),
+        delay(delay) {}
 
   // The offset of the interval relative to the root interval (i.e. all the bits
   // of the original signal).
@@ -63,9 +66,160 @@ struct Interval {
   uint64_t bitwidth;
   // The value written to this interval or the OpResult of a read.
   Value value;
+  // The block the originating probe/drive lived in. Equal to the signal's
+  // own block except for reads/writes reached via the single-block
+  // `llhd.combinational` transparency carve-out above, in which case this is
+  // that op's body block instead.
+  Block *block;
   // The delay with which the value is written.
   llhd::TimeAttr delay;
 };
+
+/// A narrowed slice of a whole-signal drive: the range [bitOffset,
+/// bitOffset+bitwidth) of the overall signal that this slice genuinely
+/// writes. The caller is responsible for building the actual replacement
+/// value (by extracting this same range back out of the drive's own
+/// value -- see the two call sites below), this struct only records WHERE.
+struct NarrowedWrite {
+  uint64_t bitOffset;
+  uint64_t bitwidth;
+};
+
+/// Unwraps a clock-enable self-feedback mux, if present: a clock-enable
+/// register is `Deseq`'d into `next = comb.mux(enable, <new-value
+/// structure>, <self-feedback>)` ("hold current value when disabled")
+/// rather than the new-value structure directly. The enable condition
+/// doesn't change WHICH position a register is responsible for, only
+/// whether it updates that position or holds it, and either way extracting
+/// the position back out of the register's OWN result (built by the
+/// caller) reflects the correct current content regardless of which
+/// branch fired -- so this just recurses into whichever mux operand is
+/// NOT the self-feedback value, when `selfFeedback` is non-null and such a
+/// mux is present; otherwise returns `feeder` unchanged.
+static Value unwrapClockEnable(Value feeder, Value selfFeedback) {
+  if (!selfFeedback)
+    return feeder;
+  if (auto muxOp = feeder.getDefiningOp<comb::MuxOp>()) {
+    if (muxOp.getTrueValue() == selfFeedback)
+      return muxOp.getFalseValue();
+    if (muxOp.getFalseValue() == selfFeedback)
+      return muxOp.getTrueValue();
+  }
+  return feeder;
+}
+
+/// Attempt to decompose a whole-signal drive into a set of narrower,
+/// per-element writes by inspecting a *value feeding it* (typically a
+/// `seq.firreg`'s `next` operand, i.e. `feeder` is NOT the driven value
+/// itself -- see the DriveOp handling below, and `unwrapClockEnable` above)
+/// for a chain of `hw.array_inject`s over a shared base that is itself a
+/// probe of `sigOp`. This is the shape `Deseq` produces for a
+/// `for (genvar i...)` per-element clocked write: each resulting
+/// `seq.firreg`'s "next" value is nominally the FULL array, but is
+/// actually the array probed at the START of this evaluation
+/// (`llhd.prb %sigOp`) with only its own element(s) replaced -- multiple
+/// such firregs, each individually reported as a full-width write, look
+/// "potentially overlapping" to isPromotable()'s conservative check even
+/// though they write disjoint elements, because the untouched portion of
+/// each is a faithful, unconditional copy of the SAME prior signal value
+/// every sibling write (and the overall reconstruction's `preVal`) already
+/// accounts for -- narrowing here just makes that already-true fact
+/// visible to the interval algorithm instead of reporting a conservative
+/// upper bound.
+///
+/// Returns the peeled writes on success (may be more than one, for a chain
+/// injecting several positions), or std::nullopt if `feeder` doesn't have
+/// this shape -- in which case the caller should fall back to a single
+/// full-width interval, exactly as before this narrowing existed.
+static std::optional<SmallVector<NarrowedWrite>>
+tryNarrowArrayInjectChain(Value feeder, llhd::SignalOp sigOp) {
+  SmallVector<NarrowedWrite> narrowed;
+  Value cur = feeder;
+  while (auto injectOp = cur.getDefiningOp<hw::ArrayInjectOp>()) {
+    auto constIdx = injectOp.getIndex().getDefiningOp<hw::ConstantOp>();
+    if (!constIdx)
+      return std::nullopt;
+
+    auto arrayTy = cast<hw::ArrayType>(injectOp.getInput().getType());
+    auto elemBw = hw::getBitWidth(injectOp.getElement().getType());
+    if (elemBw <= 0)
+      return std::nullopt;
+
+    // Element 0 occupies the LOW bits of the flattened bitcast
+    // representation. Verified against upstream CIRCT's own ops (the
+    // authoritative convention, since the resolved value assembled from
+    // these offsets is consumed by upstream array_get/bitcast lowering):
+    // `hw.array_get (hw.bitcast %x : (i64) -> !hw.array<2xi32>)[0]`
+    // exports as `x[31:0]`. The earlier revision of this code claimed the
+    // opposite ("element 0 in the HIGH bits") from reading
+    // `hw.aggregate_constant [1, 2] : !hw.array<2xi32>` == 0x1_00000002 --
+    // but that experiment was misread: aggregate_constant (like
+    // array_create) lists elements HIGHEST-INDEX-FIRST, so the leading
+    // `1` is element 1 (high bits) and element 0 is the trailing `2`
+    // (low bits), consistent with element-0-at-LSB. The flipped offset
+    // this produced made reads of array entry i resolve to entry N-1-i's
+    // storage (a real, silent miscompilation of ibex_fetch_fifo's FIFO,
+    // caught by a depth-2 bounded equivalence check against the RTL).
+    uint64_t index = constIdx.getValue().getZExtValue();
+    uint64_t offset = index * elemBw;
+    narrowed.push_back({offset, static_cast<uint64_t>(elemBw)});
+    cur = injectOp.getInput();
+  }
+
+  if (narrowed.empty())
+    return std::nullopt;
+
+  auto probeOp = cur.getDefiningOp<llhd::ProbeOp>();
+  if (!probeOp || probeOp.getSignal() != sigOp.getResult())
+    return std::nullopt;
+
+  return narrowed;
+}
+
+/// The bit-vector counterpart of `tryNarrowArrayInjectChain`, for a
+/// non-aggregate (plain integer) signal: `Deseq` represents a per-position
+/// clocked bitfield write as `comb.concat(..., <new bits>, ...)` where the
+/// OTHER operands are `comb.extract`s of the shared `llhd.prb %sigOp`
+/// (faithfully passing through whatever those bit ranges already held).
+/// Every operand must be classified (either a probe-extract, contributing
+/// no interval since `preVal` already covers it, or a genuine write) for
+/// this to succeed -- a concat with any operand that is neither falls back
+/// to std::nullopt, same as the array case.
+static std::optional<SmallVector<NarrowedWrite>>
+tryNarrowBitConcatChain(Value feeder, llhd::SignalOp sigOp) {
+  auto concatOp = feeder.getDefiningOp<comb::ConcatOp>();
+  if (!concatOp)
+    return std::nullopt;
+
+  SmallVector<NarrowedWrite> narrowed;
+  // comb.concat operands are MSB-first (verified empirically against this
+  // exact construct: `comb.extract %prb from 1 : (i3) -> i2` (bits [2:1])
+  // followed by the new bit becomes `comb.concat %that, %newBit`, i.e. the
+  // higher-order extract comes first) -- walk operands accumulating from
+  // the top bit down.
+  uint64_t bitWidth = hw::getBitWidth(concatOp.getType());
+  uint64_t highBit = bitWidth;
+  for (Value operand : concatOp.getInputs()) {
+    uint64_t width = hw::getBitWidth(operand.getType());
+    uint64_t lowBit = highBit - width;
+    highBit = lowBit;
+
+    if (auto extractOp = operand.getDefiningOp<comb::ExtractOp>()) {
+      if (auto probeOp = extractOp.getInput().getDefiningOp<llhd::ProbeOp>()) {
+        if (probeOp.getSignal() == sigOp.getResult() &&
+            extractOp.getLowBit() == lowBit) {
+          continue; // Faithful pass-through -- no interval needed here.
+        }
+      }
+    }
+
+    narrowed.push_back({lowBit, width});
+  }
+
+  if (narrowed.empty())
+    return std::nullopt;
+  return narrowed;
+}
 
 class SigPromoter {
 public:
@@ -85,8 +239,30 @@ public:
       auto offset = currAndOffset.second;
 
       if (curr->getBlock() != sigOp->getBlock()) {
-        LLVM_DEBUG(llvm::dbgs() << "  - User in other block, skipping...\n\n");
-        return failure();
+        // A user nested directly inside an `llhd.combinational` op can be
+        // treated as if it were in the signal's own block when that op's
+        // body is a single block: `llhd.combinational` regions are only
+        // constrained to MinSizedRegion<1>, so they can in general contain
+        // real control flow (multiple blocks joined by `cf.cond_br`, per
+        // the op's own documented example) whose reaching-drive semantics
+        // this interval-based algorithm does not attempt to model -- but a
+        // single-block body has no such branching and, by the op's
+        // documented semantics ("executes once... whenever any of the
+        // values used in its body change"), always runs end-to-end
+        // unconditionally, exactly like inlined straight-line code. This
+        // lets signals driven inside a straight-line `llhd.combinational`
+        // (the common shape for e.g. an unrolled `always_comb` loop body)
+        // but probed from the enclosing module body promote instead of
+        // bailing outright.
+        auto combOp =
+            dyn_cast_or_null<llhd::CombinationalOp>(curr->getParentOp());
+        bool transparent = combOp && combOp->getBlock() == sigOp->getBlock() &&
+                           combOp.getBody().hasOneBlock();
+        if (!transparent) {
+          LLVM_DEBUG(llvm::dbgs()
+                     << "  - User in other block, skipping...\n\n");
+          return failure();
+        }
       }
 
       auto result =
@@ -96,7 +272,8 @@ public:
                 if (bw <= 0)
                   return failure();
 
-                readIntervals.emplace_back(offset, bw, probeOp.getResult());
+                readIntervals.emplace_back(offset, bw, probeOp.getResult(),
+                                           curr->getBlock());
                 return success();
               })
               .Case<llhd::DriveOp>([&](llhd::DriveOp driveOp) {
@@ -118,7 +295,61 @@ public:
                 if (bw <= 0)
                   return failure();
 
+                // A whole-signal drive fed by a `seq.firreg` whose `next`
+                // operand (modulo an enclosing clock-enable self-feedback
+                // mux) is an array-inject chain, or a bit-concat of
+                // probe-extracts and new bits, over a probe of this same
+                // signal is the per-element/per-bitfield clocked-write
+                // shape described above: narrow to one interval per
+                // written slice, each valued by extracting that slice back
+                // out of the firreg's own RESULT (not out of `next` -- the
+                // signal's future value at that position is what the
+                // register will hold, i.e. its result, not the
+                // combinational value feeding it).
+                if (offset.isStatic() && offset.min == 0) {
+                  if (auto firregOp =
+                          driveOp.getValue().getDefiningOp<seq::FirRegOp>()) {
+                    Value feeder =
+                        unwrapClockEnable(firregOp.getNext(), firregOp.getResult());
+                    auto narrowed = tryNarrowArrayInjectChain(feeder, sigOp);
+                    if (!narrowed)
+                      narrowed = tryNarrowBitConcatChain(feeder, sigOp);
+                    if (narrowed) {
+                      bool isArray = isa<hw::ArrayType>(driveOp.getValue().getType());
+                      auto arrayTy = isArray ? cast<hw::ArrayType>(
+                                                  driveOp.getValue().getType())
+                                            : hw::ArrayType();
+                      uint64_t elemBw =
+                          isArray ? hw::getBitWidth(arrayTy.getElementType()) : 0;
+                      OpBuilder b(driveOp);
+                      for (auto &write : *narrowed) {
+                        Value elem;
+                        if (isArray) {
+                          uint64_t index = write.bitOffset / elemBw;
+                          Value idx = hw::ConstantOp::create(
+                              b, driveOp.getLoc(),
+                              APInt(llvm::Log2_64_Ceil(arrayTy.getNumElements()),
+                                   index));
+                          elem = hw::ArrayGetOp::create(b, driveOp.getLoc(),
+                                                        driveOp.getValue(), idx);
+                        } else {
+                          elem = comb::ExtractOp::create(
+                              b, driveOp.getLoc(),
+                              b.getIntegerType(write.bitwidth),
+                              driveOp.getValue(), write.bitOffset);
+                        }
+                        intervals.emplace_back(Offset(write.bitOffset),
+                                               write.bitwidth, elem,
+                                               curr->getBlock(),
+                                               timeOp.getValueAttr());
+                      }
+                      return success();
+                    }
+                  }
+                }
+
                 intervals.emplace_back(offset, bw, driveOp.getValue(),
+                                       curr->getBlock(),
                                        timeOp.getValueAttr());
                 return success();
               })
@@ -221,11 +452,62 @@ public:
     auto bw = hw::getBitWidth(sigOp.getInit().getType());
     assert(bw > 0 && "bw must be known and non-zero");
 
-    OpBuilder builder(sigOp);
-    Value val = sigOp.getInit();
+    // Normally every interval lives in sigOp's own block and the whole
+    // reconstruction can be built right at sigOp. The single-block
+    // `llhd.combinational` transparency carve-out above means some
+    // interval's originating probe/drive may instead live inside that op's
+    // body -- in that case the reconstruction must be built there instead
+    // (the only point that dominates values defined inside it), and any
+    // read whose ORIGINAL probe was outside that block (i.e. back at
+    // sigOp's own block) has to have its resolved value threaded back out
+    // through the combinational op's results, since a value defined in a
+    // child region cannot directly satisfy a use in the parent.
+    Block *sigBlock = sigOp->getBlock();
+    Block *foreignBlock = nullptr;
+    for (auto &interval : intervals)
+      if (interval.block != sigBlock)
+        foreignBlock = interval.block;
+    for (auto &interval : readIntervals)
+      if (interval.block != sigBlock)
+        foreignBlock = interval.block;
+    assert((!foreignBlock ||
+            llvm::all_of(intervals,
+                         [&](auto &i) {
+                           return i.block == sigBlock ||
+                                  i.block == foreignBlock;
+                         })) &&
+           "at most one foreign block supported");
+
+    // `outerBuilder` sits at sigOp's own position, which -- because a value
+    // defined in a parent block is visible everywhere in a nested region --
+    // dominates every point inside `foreignBlock` regardless of where in
+    // that block a given use sits. `preVal` (the signal's value before any
+    // of this reconstruction's writes) is built here, and is what any read
+    // whose ORIGINAL probe lived inside `foreignBlock` must resolve to:
+    // such a read is, structurally, always the seed mem2reg's own rewrite
+    // chain was built from (e.g. `%4 = llhd.prb %sig` feeding the first
+    // `hw.array_inject` in the examples above) -- i.e. the value as of
+    // entry to the block, before this pass's own reconstructed writes are
+    // applied -- never some partially-written intermediate state, since
+    // mem2reg does not re-probe the raw signal mid-chain. Resolving it to
+    // the fully-POST-write `val` instead (as a same-block read normally
+    // would) would make that value depend on its own seed, a genuine
+    // circular/non-dominating definition -- exactly the dominance failure
+    // this split avoids.
+    OpBuilder outerBuilder(sigOp);
     Location loc = sigOp->getLoc();
-    auto type = builder.getIntegerType(bw);
-    val = builder.createOrFold<hw::BitcastOp>(loc, type, val);
+    auto type = outerBuilder.getIntegerType(bw);
+    Value preVal =
+        outerBuilder.createOrFold<hw::BitcastOp>(loc, type, sigOp.getInit());
+
+    // `builder` builds the write-reconstruction chain and, when there is a
+    // foreign block, must live inside it (the only point that dominates
+    // interval values defined there); with no foreign block this is exactly
+    // the original single-block behavior, unchanged.
+    OpBuilder builder = outerBuilder;
+    if (foreignBlock)
+      builder.setInsertionPoint(foreignBlock->getTerminator());
+    Value val = preVal;
 
     // Handle the writes by starting with the signal init value and injecting
     // the written values at the right offsets.
@@ -264,29 +546,77 @@ public:
     }
 
     // Handle the reads by extracting right number of bits at the right offset.
+    // Reads whose original probe lived outside the block the reconstruction
+    // was built in (i.e. back in sigOp's own block, while `val` was built
+    // inside a foreign transparent `llhd.combinational`) can't be wired up
+    // via replaceAllUsesWith directly -- collected here and threaded out
+    // through the combinational op's results afterward instead.
+    SmallVector<std::pair<Value, Value>> escaping;
     for (auto interval : readIntervals) {
-      if (interval.low.isStatic()) {
-        Value read = builder.createOrFold<comb::ExtractOp>(
-            loc, builder.getIntegerType(interval.bitwidth), val,
-            interval.low.min);
-        read = builder.createOrFold<hw::BitcastOp>(
-            loc, interval.value.getType(), read);
-        if (read != interval.value) {
-          interval.value.replaceAllUsesWith(read);
-        }
-        continue;
-      }
+      // A read whose original probe lived inside the foreign block resolves
+      // against the PRE-write value, built with the outer builder (see the
+      // comment above `preVal`); every other read -- either the ordinary
+      // single-block case, or one that must escape a foreign block --
+      // resolves against the fully-reconstructed POST-write `val`.
+      bool isForeignSeed = foreignBlock && interval.block == foreignBlock;
+      OpBuilder &b = isForeignSeed ? outerBuilder : builder;
+      Value base = isForeignSeed ? preVal : val;
 
-      Value read = buildDynamicIndex(builder, loc, interval.low.min,
-                                     interval.low.dynamic, bw);
-      read = builder.createOrFold<comb::ShrUOp>(loc, val, read);
-      read = builder.createOrFold<comb::ExtractOp>(
-          loc, builder.getIntegerType(interval.bitwidth), read, 0);
-      read = builder.createOrFold<hw::BitcastOp>(loc, interval.value.getType(),
-                                                 read);
-      if (read != interval.value) {
-        interval.value.replaceAllUsesWith(read);
+      Value read;
+      if (interval.low.isStatic()) {
+        read = b.createOrFold<comb::ExtractOp>(
+            loc, b.getIntegerType(interval.bitwidth), base, interval.low.min);
+      } else {
+        Value amt = buildDynamicIndex(b, loc, interval.low.min,
+                                      interval.low.dynamic, bw);
+        read = b.createOrFold<comb::ShrUOp>(loc, base, amt);
+        read = b.createOrFold<comb::ExtractOp>(
+            loc, b.getIntegerType(interval.bitwidth), read, 0);
       }
+      read = b.createOrFold<hw::BitcastOp>(loc, interval.value.getType(), read);
+
+      if (read == interval.value)
+        continue;
+      if (foreignBlock && interval.block != foreignBlock)
+        escaping.emplace_back(interval.value, read);
+      else
+        interval.value.replaceAllUsesWith(read);
+    }
+
+    // Thread any escaping values (resolved inside the foreign
+    // `llhd.combinational`, but originally probed from sigOp's own block)
+    // out through that op's results: MLIR op result lists are fixed at
+    // creation, so this rebuilds the op with the additional result types,
+    // moves its body over unchanged, extends its `llhd.yield` with the
+    // escaping values, and redirects both the op's pre-existing result uses
+    // and each escaping probe's uses to the appropriate result of the new op.
+    if (!escaping.empty()) {
+      auto oldCombOp = cast<llhd::CombinationalOp>(foreignBlock->getParentOp());
+      SmallVector<Type> resultTypes(oldCombOp.getResultTypes());
+      for (auto &[oldValue, newValue] : escaping)
+        resultTypes.push_back(newValue.getType());
+
+      OpBuilder combBuilder(oldCombOp);
+      auto newCombOp = llhd::CombinationalOp::create(combBuilder,
+                                                     oldCombOp.getLoc(),
+                                                     resultTypes);
+      newCombOp.getBody().takeBody(oldCombOp.getBody());
+
+      auto yieldOp =
+          cast<llhd::YieldOp>(newCombOp.getBody().front().getTerminator());
+      SmallVector<Value> yieldOperands(yieldOp.getOperands());
+      for (auto &[oldValue, newValue] : escaping)
+        yieldOperands.push_back(newValue);
+      yieldOp->setOperands(yieldOperands);
+
+      for (auto [oldResult, newResult] :
+           llvm::zip(oldCombOp.getResults(), newCombOp.getResults()))
+        oldResult.replaceAllUsesWith(newResult);
+      for (auto [i, pair] : llvm::enumerate(escaping))
+        pair.first.replaceAllUsesWith(
+            newCombOp.getResult(oldCombOp.getNumResults() + i));
+
+      oldCombOp->erase();
     }
 
     // Delete all operations operating on signal values.

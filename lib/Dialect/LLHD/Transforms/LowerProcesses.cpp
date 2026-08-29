@@ -38,8 +38,14 @@ struct Lowering {
   bool allOperandsObserved();
   bool isObserved(Value value);
 
+  bool canReRootAtWaitDest();
+  bool checkNoValuesLiveAcrossWait();
+
   ProcessOp processOp;
   WaitOp waitOp;
+  /// Set when the process is combinational but does not have the shape where
+  /// entry and wait converge. See `canReRootAtWaitDest`.
+  bool reRootAtWaitDest = false;
   SmallDenseSet<Value> observedValues;
 };
 } // namespace
@@ -61,6 +67,30 @@ void Lowering::lower() {
   processOp.replaceAllUsesWith(executeOp);
   processOp.erase();
   processOp = {};
+
+  // If the process carries its outputs around the wait loop as block
+  // arguments, the entry block only supplies their pre-first-event values and
+  // the real computation hangs off the wait's destination. Make that
+  // destination the region's entry block, so the initialisation path becomes
+  // unreachable and `simplifyRegions` below drops it. Without this the
+  // combinational op would yield the initial constants and the whole body
+  // would be deleted as unreachable.
+  if (reRootAtWaitDest) {
+    auto &region = executeOp.getRegion();
+    auto &blocks = region.getBlocks();
+    if (waitOp.getDestOperands().empty()) {
+      blocks.splice(blocks.begin(), blocks, waitOp.getDest()->getIterator());
+    } else {
+      // The destination needs arguments, so it cannot itself be the entry.
+      // Prepend a block that jumps to it with the wait's own destination
+      // operands, all of which are defined outside the process.
+      auto *newEntry = new Block();
+      blocks.push_front(newEntry);
+      OpBuilder entryBuilder(newEntry, newEntry->begin());
+      cf::BranchOp::create(entryBuilder, waitOp.getLoc(), waitOp.getDest(),
+                           waitOp.getDestOperands());
+    }
+  }
 
   // Replace the `llhd.wait` with an `llhd.yield`.
   builder.setInsertionPoint(waitOp);
@@ -102,9 +132,15 @@ bool Lowering::matchControlFlow() {
     return false;
   }
   if (!waitOp.getDestOperands().empty()) {
-    LLVM_DEBUG(llvm::dbgs() << "Skipping process " << processOp.getLoc()
-                            << ": wait op has destination operands\n");
-    return false;
+    // The destination operands can still be supplied by a synthetic entry
+    // block, provided they are defined outside the process (see
+    // canReRootAtWaitDest).
+    if (!canReRootAtWaitDest()) {
+      LLVM_DEBUG(llvm::dbgs() << "Skipping process " << processOp.getLoc()
+                              << ": wait op has destination operands\n");
+      return false;
+    }
+    reRootAtWaitDest = true;
   }
   if (waitOp.getDelay()) {
     LLVM_DEBUG(llvm::dbgs() << "Skipping process " << processOp.getLoc()
@@ -130,14 +166,21 @@ bool Lowering::matchControlFlow() {
   };
 
   // Ensure that the entry block and wait op converge on the same block.
+  // Re-rooting makes this moot: the entry path is dropped outright.
+  if (reRootAtWaitDest)
+    return checkNoValuesLiveAcrossWait();
+
   auto &entry = processOp.getBody().front();
   auto [entryMergeBlock, entryMergeArgs] = skipToMergePoint(&entry);
   auto [waitMergeBlock, waitMergeArgs] = skipToMergePoint(waitOp.getDest());
   if (entryMergeBlock != waitMergeBlock) {
-    LLVM_DEBUG(llvm::dbgs()
-               << "Skipping process " << processOp.getLoc()
-               << ": control from entry and wait does not converge\n");
-    return false;
+    if (!canReRootAtWaitDest()) {
+      LLVM_DEBUG(llvm::dbgs()
+                 << "Skipping process " << processOp.getLoc()
+                 << ": control from entry and wait does not converge\n");
+      return false;
+    }
+    reRootAtWaitDest = true;
   }
 
   // Helper function to check if two values are equivalent.
@@ -155,15 +198,23 @@ bool Lowering::matchControlFlow() {
 
   // Ensure that the entry block and wait op converge with equivalent block
   // arguments.
-  if (!llvm::all_of(llvm::zip(entryMergeArgs, waitMergeArgs),
+  if (!reRootAtWaitDest &&
+      !llvm::all_of(llvm::zip(entryMergeArgs, waitMergeArgs),
                     areValuesEquivalent)) {
-    LLVM_DEBUG(llvm::dbgs() << "Skipping process " << processOp.getLoc()
-                            << ": control from entry and wait converges with "
-                               "different block arguments\n");
-    return false;
+    if (!canReRootAtWaitDest()) {
+      LLVM_DEBUG(llvm::dbgs() << "Skipping process " << processOp.getLoc()
+                              << ": control from entry and wait converges with "
+                                 "different block arguments\n");
+      return false;
+    }
+    reRootAtWaitDest = true;
   }
 
-  // Ensure that no values are live across the wait op.
+  return checkNoValuesLiveAcrossWait();
+}
+
+/// Ensure that no values are live across the wait op.
+bool Lowering::checkNoValuesLiveAcrossWait() {
   Liveness liveness(processOp);
   for (auto value : liveness.getLiveOut(waitOp->getBlock())) {
     if (value.getParentRegion()->isProperAncestor(&processOp.getBody()))
@@ -175,6 +226,68 @@ bool Lowering::matchControlFlow() {
     });
     return false;
   }
+  return true;
+}
+
+/// Check whether a process that does NOT have the "entry and wait converge"
+/// shape is nevertheless combinational, by carrying its outputs around the
+/// wait loop as block arguments.
+///
+/// This is the shape older Verilog produces for `always @(*)` with case
+/// statements assigning to regs -- pervasive in OpenC910, where it accounts
+/// for 912 of 1,441 processes:
+///
+///     ^bb0:                                   // entry, pre-first-event values
+///       cf.br ^bb1(%c0, %false : i66, i1)
+///     ^bb1(%v0: i66, %v1: i1):                // loop header
+///       llhd.wait yield (%v0, %v1), (%a, %b), ^bb2
+///     ^bb2:                                   // the real body
+///       ...
+///       cf.br ^bb1(%computed0, %computed1)
+///
+/// The header's block arguments are the process' outputs. The entry block
+/// only supplies their value before the first input event; every path through
+/// the body branches back with freshly computed values. So the process IS a
+/// function of its inputs, and the combinational form is obtained by making
+/// the wait's destination the entry block -- dropping the initialisation path.
+///
+/// That is only sound when the loop-carried arguments feed nothing but the
+/// wait itself. If the body READ them, a path that branched back without
+/// reassigning would preserve the previous value -- a latch, i.e. real state,
+/// which is not combinational and must not be lowered this way. Requiring the
+/// arguments to be used solely as wait yield operands rules that out.
+///
+/// Dropping the initialisation path changes the value yielded before the
+/// first input event, from the entry constants to `f(inputs)`. For synthesis
+/// that is the correct reading -- combinational logic has no "initial" value
+/// -- and it also matches Verilog, where an `always @(*)` block does execute
+/// at time zero.
+bool Lowering::canReRootAtWaitDest() {
+  // The loop-carried values must not be read by the body.
+  for (auto arg : waitOp->getBlock()->getArguments())
+    for (auto &use : arg.getUses())
+      if (use.getOwner() != waitOp.getOperation())
+        return false;
+
+  // If the destination takes arguments, a synthetic entry block has to supply
+  // them, so every operand must already dominate the process -- i.e. be
+  // defined outside it. An operand computed inside the body cannot be used to
+  // start the body.
+  for (auto operand : waitOp.getDestOperands())
+    if (!operand.getParentRegion()->isProperAncestor(&processOp.getBody()))
+      return false;
+
+  // The entry block must carry nothing but its branch: once it is unreachable
+  // it gets deleted, and anything it defined would leave dangling uses.
+  auto &entry = processOp.getBody().front();
+  if (!entry.without_terminator().empty())
+    return false;
+  if (!isa<cf::BranchOp>(entry.getTerminator()))
+    return false;
+
+  // Re-rooting at the entry block itself would be a no-op loop.
+  if (waitOp.getDest() == &entry)
+    return false;
 
   return true;
 }
