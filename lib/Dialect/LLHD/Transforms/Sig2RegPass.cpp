@@ -409,10 +409,40 @@ public:
                 // register will hold, i.e. its result, not the
                 // combinational value feeding it).
                 if (offset.isStatic() && offset.min == 0) {
-                  if (auto firregOp =
-                          driveOp.getValue().getDefiningOp<seq::FirRegOp>()) {
-                    auto narrowed = tryNarrowFeeder(firregOp.getNext(), sigOp,
-                                                    firregOp.getResult());
+                  // The narrowable shape usually sits behind a register (the
+                  // drive value is a seq.firreg and its `next` carries the
+                  // pass-through), but not always: a purely combinational
+                  // drive can carry it directly, e.g. OpenC910's
+                  // `ifu_icache_tag_wen` is driven by
+                  // `concat(%new, extract(prb(self), 0))` with no register in
+                  // between. Gating on the firreg missed those entirely and
+                  // reported them at full width.
+                  auto firregOp = driveOp.getValue().getDefiningOp<seq::FirRegOp>();
+                  {
+                    // Which value carries the narrowable shape:
+                    //  * no register        -> the drive value itself
+                    //  * `next` is the reg  -> the register never changes, so
+                    //    it holds its RESET value forever and that is where
+                    //    the shape lives. OpenC910's `ct_prio*` initialise an
+                    //    array per element this way:
+                    //        %r = seq.firreg %r ... reset %rst,
+                    //             hw.array_inject (llhd.prb %sig)[k], %c
+                    //    Reading `next` there just finds the register itself,
+                    //    which narrows to nothing and forces full width.
+                    //  * otherwise          -> `next`
+                    Value feeder;
+                    Value selfFeedback;
+                    if (!firregOp) {
+                      feeder = driveOp.getValue();
+                    } else if (firregOp.getNext() == firregOp.getResult() &&
+                               firregOp.getResetValue()) {
+                      feeder = firregOp.getResetValue();
+                      selfFeedback = firregOp.getResult();
+                    } else {
+                      feeder = firregOp.getNext();
+                      selfFeedback = firregOp.getResult();
+                    }
+                    auto narrowed = tryNarrowFeeder(feeder, sigOp, selfFeedback);
                     if (narrowed) {
                       bool isArray = isa<hw::ArrayType>(driveOp.getValue().getType());
                       auto arrayTy = isArray ? cast<hw::ArrayType>(
