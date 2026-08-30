@@ -249,6 +249,62 @@ struct HWStructExtractOpConversion : OpConversionPattern<hw::StructExtractOp> {
   }
 };
 
+/// Lower hw.struct_inject to comb ops: replace the field's bit range in the
+/// flattened input with the new value. Same layout convention as
+/// HWStructExtractOpConversion above: the FIRST field occupies the MSBs.
+///
+/// Without this pattern struct_inject was not even marked illegal, so it
+/// survived the pass and kept its hw.aggregate_constant operands alive --
+/// on CVA6 that left 608 injects and 75 aggregate constants after
+/// conversion, and every residual module carrying one was rejected as
+/// unmappable to AIGER. (OpenC910 never noticed: its RTL style produces
+/// array_injects, which were handled.)
+struct HWStructInjectOpConversion : OpConversionPattern<hw::StructInjectOp> {
+  using OpConversionPattern<hw::StructInjectOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(hw::StructInjectOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto structType = cast<hw::StructType>(op.getInput().getType());
+    auto fieldIndex = op.getFieldIndex();
+    auto elements = structType.getElements();
+
+    int64_t totalBitWidth = hw::getBitWidth(structType);
+    if (totalBitWidth < 0)
+      return rewriter.notifyMatchFailure(op.getLoc(), "unknown struct width");
+
+    int64_t consumedBits = 0;
+    for (size_t i = 0; i < fieldIndex; ++i) {
+      int64_t fieldWidth = hw::getBitWidth(elements[i].type);
+      if (fieldWidth < 0)
+        return rewriter.notifyMatchFailure(op.getLoc(), "unknown field width");
+      consumedBits += fieldWidth;
+    }
+    int64_t fieldWidth = hw::getBitWidth(elements[fieldIndex].type);
+    if (fieldWidth < 0)
+      return rewriter.notifyMatchFailure(op.getLoc(), "unknown field width");
+
+    int64_t bitOffset = totalBitWidth - consumedBits - fieldWidth;
+    auto loc = op.getLoc();
+    // comb.concat's first operand is the MSBs.
+    SmallVector<Value> parts;
+    if (bitOffset + fieldWidth < totalBitWidth)
+      parts.push_back(comb::ExtractOp::create(
+          rewriter, loc, adaptor.getInput(), bitOffset + fieldWidth,
+          totalBitWidth - bitOffset - fieldWidth));
+    parts.push_back(adaptor.getNewValue());
+    if (bitOffset > 0)
+      parts.push_back(
+          comb::ExtractOp::create(rewriter, loc, adaptor.getInput(), 0,
+                                  bitOffset));
+    if (parts.size() == 1)
+      rewriter.replaceOp(op, parts[0]);
+    else
+      rewriter.replaceOpWithNewOp<comb::ConcatOp>(op, parts);
+    return success();
+  }
+};
+
 struct MuxOpConversion : OpConversionPattern<comb::MuxOp> {
   using OpConversionPattern<comb::MuxOp>::OpConversionPattern;
 
@@ -304,7 +360,8 @@ static void populateHWAggregateToCombOpConversionPatterns(
                HWArrayCreateLikeOpConversion<hw::ArrayConcatOp>,
                HWAggregateConstantOpConversion, HWArraySliceOpConversion,
                HWArrayInjectOpConversion, HWStructCreateOpConversion,
-               HWStructExtractOpConversion, MuxOpConversion>(
+               HWStructExtractOpConversion, HWStructInjectOpConversion,
+               MuxOpConversion>(
       typeConverter, patterns.getContext());
 }
 
@@ -322,7 +379,7 @@ void HWAggregateToCombPass::runOnOperation() {
   target.addIllegalOp<hw::ArrayGetOp, hw::ArrayCreateOp, hw::ArrayConcatOp,
                       hw::AggregateConstantOp, hw::ArrayInjectOp,
                       hw::ArraySliceOp, hw::StructCreateOp,
-                      hw::StructExtractOp>();
+                      hw::StructExtractOp, hw::StructInjectOp>();
   target.addDynamicallyLegalOp<comb::MuxOp>(
       [](comb::MuxOp op) { return hw::type_isa<IntegerType>(op.getType()); });
   target.addLegalDialect<hw::HWDialect, comb::CombDialect>();
