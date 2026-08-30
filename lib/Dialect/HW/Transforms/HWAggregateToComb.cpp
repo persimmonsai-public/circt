@@ -373,15 +373,32 @@ struct HWAggregateToCombPass
 };
 } // namespace
 
+/// Ops inside an LLHD region (an unlowered `llhd.process` or
+/// `llhd.combinational`) are off limits: the conversion's materializations
+/// land at module scope, and an `llhd.wait`'s operands must be defined
+/// inside its region -- rewriting through the boundary produces
+/// "'llhd.wait' op using value defined outside the region". Checked by
+/// dialect namespace to avoid a dependency on LLHD.
+static bool isInsideLLHDRegion(Operation *op) {
+  for (auto *parent = op->getParentOp(); parent;
+       parent = parent->getParentOp())
+    if (parent->getName().getDialectNamespace() == "llhd")
+      return true;
+  return false;
+}
+
 void HWAggregateToCombPass::runOnOperation() {
   ConversionTarget target(getContext());
 
-  target.addIllegalOp<hw::ArrayGetOp, hw::ArrayCreateOp, hw::ArrayConcatOp,
-                      hw::AggregateConstantOp, hw::ArrayInjectOp,
-                      hw::ArraySliceOp, hw::StructCreateOp,
-                      hw::StructExtractOp, hw::StructInjectOp>();
-  target.addDynamicallyLegalOp<comb::MuxOp>(
-      [](comb::MuxOp op) { return hw::type_isa<IntegerType>(op.getType()); });
+  target.addDynamicallyLegalOp<hw::ArrayGetOp, hw::ArrayCreateOp,
+                               hw::ArrayConcatOp, hw::AggregateConstantOp,
+                               hw::ArrayInjectOp, hw::ArraySliceOp,
+                               hw::StructCreateOp, hw::StructExtractOp,
+                               hw::StructInjectOp>(
+      [](Operation *op) { return isInsideLLHDRegion(op); });
+  target.addDynamicallyLegalOp<comb::MuxOp>([](comb::MuxOp op) {
+    return hw::type_isa<IntegerType>(op.getType()) || isInsideLLHDRegion(op);
+  });
   target.addLegalDialect<hw::HWDialect, comb::CombDialect>();
 
   RewritePatternSet patterns(&getContext());
