@@ -309,9 +309,49 @@ tryNarrowBitConcatChain(Value feeder, llhd::SignalOp sigOp) {
 /// forces the whole feeder back to full width, and overlapping-but-unequal
 /// ranges are refused outright rather than merged, keeping this a pure
 /// narrowing of the existing conservative answer.
+/// Sort ranges by offset and coalesce overlapping or adjacent ones into
+/// their hull. Widening toward the conservative full-width answer is always
+/// sound here: NarrowedWrite records only WHERE, and callers rebuild each
+/// range from the driven value itself.
+static SmallVector<NarrowedWrite>
+coalesceRanges(SmallVector<NarrowedWrite> ranges) {
+  llvm::sort(ranges, [](const NarrowedWrite &a, const NarrowedWrite &b) {
+    if (a.bitOffset != b.bitOffset)
+      return a.bitOffset < b.bitOffset;
+    return a.bitwidth < b.bitwidth;
+  });
+  SmallVector<NarrowedWrite> coalesced;
+  for (const auto &w : ranges) {
+    if (!coalesced.empty()) {
+      NarrowedWrite &back = coalesced.back();
+      uint64_t backEnd = back.bitOffset + back.bitwidth;
+      if (w.bitOffset <= backEnd) {
+        back.bitwidth =
+            std::max(backEnd, w.bitOffset + w.bitwidth) - back.bitOffset;
+        continue;
+      }
+    }
+    coalesced.push_back(w);
+  }
+  return coalesced;
+}
+
 static std::optional<SmallVector<NarrowedWrite>>
 tryNarrowFeeder(Value feeder, llhd::SignalOp sigOp, Value selfFeedback,
-                unsigned depth = 0) {
+                unsigned depth = 0,
+                llvm::DenseMap<Value, std::optional<SmallVector<NarrowedWrite>>>
+                    *memo = nullptr) {
+  // Memoize per top-level call: real mux trees share subtrees (an FSM's
+  // else-if chain reuses its default arm), and without a cache the recursion
+  // is exponential in sharing, which is exactly what forced the old depth
+  // cap of 8 -- too small for CVA6's load_unit FSM at ~12 muxes deep. With
+  // the cache every node is visited once and the cap can be generous.
+  llvm::DenseMap<Value, std::optional<SmallVector<NarrowedWrite>>> localMemo;
+  if (!memo)
+    memo = &localMemo;
+  if (auto it = memo->find(feeder); it != memo->end())
+    return it->second;
+
   feeder = unwrapClockEnable(feeder, selfFeedback);
 
   // A feeder that is exactly a probe of the signal being driven is a pure
@@ -329,34 +369,104 @@ tryNarrowFeeder(Value feeder, llhd::SignalOp sigOp, Value selfFeedback,
   // Restricted to a probe of THIS signal; a probe of any other signal is a
   // real value being written and must keep its full-width interval.
   if (auto probeOp = feeder.getDefiningOp<llhd::ProbeOp>())
-    if (probeOp.getSignal() == sigOp.getResult())
+    if (probeOp.getSignal() == sigOp.getResult()) {
+      memo->insert({feeder, SmallVector<NarrowedWrite>{}});
       return SmallVector<NarrowedWrite>{};
+    }
 
-  if (auto narrowed = tryNarrowArrayInjectChain(feeder, sigOp))
+  if (auto narrowed = tryNarrowArrayInjectChain(feeder, sigOp)) {
+    memo->insert({feeder, narrowed});
     return narrowed;
-  if (auto narrowed = tryNarrowStructInjectChain(feeder, sigOp))
+  }
+  if (auto narrowed = tryNarrowStructInjectChain(feeder, sigOp)) {
+    memo->insert({feeder, narrowed});
     return narrowed;
-  if (auto narrowed = tryNarrowBitConcatChain(feeder, sigOp))
+  }
+  if (auto narrowed = tryNarrowBitConcatChain(feeder, sigOp)) {
+    memo->insert({feeder, narrowed});
     return narrowed;
+  }
 
-  // Bound the recursion: these mux trees are shallow in practice, and a cap
-  // keeps a pathological input from costing more than the promotion is worth.
-  static constexpr unsigned kMaxMuxDepth = 8;
+  // The chain helpers above require the inject chain to bottom out DIRECTLY
+  // at a probe of the signal. Real RTL composes deeper: CVA6's load_unit FSM
+  // produces `struct_inject(mux(inject-chain, inject-chain), "kill_req")` --
+  // a default-values chain, muxed per FSM state, with per-state overrides
+  // injected on top. Handle a single inject generically by recursing on its
+  // BASE through the full narrowing (so muxes and further injects compose)
+  // and unioning in the injected range.
+  if (auto injectOp = feeder.getDefiningOp<hw::StructInjectOp>()) {
+    auto structTy = hw::type_cast<hw::StructType>(injectOp.getInput().getType());
+    auto index = structTy.getFieldIndex(injectOp.getFieldNameAttr());
+    if (index) {
+      auto elements = structTy.getElements();
+      auto fieldBw = hw::getBitWidth(elements[*index].type);
+      uint64_t off = 0;
+      bool ok = fieldBw > 0;
+      for (size_t i = *index + 1, e = elements.size(); ok && i < e; ++i) {
+        auto bw = hw::getBitWidth(elements[i].type);
+        if (bw < 0)
+          ok = false;
+        else
+          off += bw;
+      }
+      if (ok) {
+        auto base = tryNarrowFeeder(injectOp.getInput(), sigOp, selfFeedback,
+                                    depth + 1, memo);
+        if (base) {
+          base->push_back({off, static_cast<uint64_t>(fieldBw)});
+          auto result = coalesceRanges(std::move(*base));
+          memo->insert({feeder, result});
+          return result;
+        }
+      }
+    }
+    memo->insert({feeder, std::nullopt});
+    return std::nullopt;
+  }
+  if (auto injectOp = feeder.getDefiningOp<hw::ArrayInjectOp>()) {
+    auto constIdx = injectOp.getIndex().getDefiningOp<hw::ConstantOp>();
+    auto elemBw = hw::getBitWidth(injectOp.getElement().getType());
+    if (constIdx && elemBw > 0) {
+      auto base = tryNarrowFeeder(injectOp.getInput(), sigOp, selfFeedback,
+                                  depth + 1, memo);
+      if (base) {
+        base->push_back({constIdx.getValue().getZExtValue() * elemBw,
+                         static_cast<uint64_t>(elemBw)});
+        auto result = coalesceRanges(std::move(*base));
+        memo->insert({feeder, result});
+        return result;
+      }
+    }
+    memo->insert({feeder, std::nullopt});
+    return std::nullopt;
+  }
+
+  // Bound the recursion. With memoization each distinct node is visited
+  // once, so this is a safety net against degenerate inputs, not a real
+  // limit -- but it must still exceed the depth of real FSM else-if chains
+  // (CVA6's load_unit needs ~12).
+  static constexpr unsigned kMaxMuxDepth = 64;
   if (depth >= kMaxMuxDepth)
     return std::nullopt;
 
   auto muxOp = feeder.getDefiningOp<comb::MuxOp>();
-  if (!muxOp)
+  if (!muxOp) {
+    memo->insert({feeder, std::nullopt});
     return std::nullopt;
+  }
 
   auto lhs = tryNarrowFeeder(muxOp.getTrueValue(), sigOp, selfFeedback,
-                             depth + 1);
-  if (!lhs)
+                             depth + 1, memo);
+  if (!lhs) {
+    memo->insert({feeder, std::nullopt});
     return std::nullopt;
+  }
   auto rhs = tryNarrowFeeder(muxOp.getFalseValue(), sigOp, selfFeedback,
-                             depth + 1);
-  if (!rhs)
+                             depth + 1, memo);
+  if (!rhs) {
+    memo->insert({feeder, std::nullopt});
     return std::nullopt;
+  }
 
   // An empty union means the drive provably writes nothing at all. Rather
   // than emit zero intervals -- which would drop the drive and silently
@@ -381,27 +491,8 @@ tryNarrowFeeder(Value feeder, llhd::SignalOp sigOp, Value selfFeedback,
   // width there made the two disjoint drives look like they collide.
   SmallVector<NarrowedWrite> merged(*lhs);
   merged.append(rhs->begin(), rhs->end());
-  llvm::sort(merged, [](const NarrowedWrite &a, const NarrowedWrite &b) {
-    if (a.bitOffset != b.bitOffset)
-      return a.bitOffset < b.bitOffset;
-    return a.bitwidth < b.bitwidth;
-  });
-
-  SmallVector<NarrowedWrite> coalesced;
-  for (const auto &w : merged) {
-    if (!coalesced.empty()) {
-      NarrowedWrite &back = coalesced.back();
-      uint64_t backEnd = back.bitOffset + back.bitwidth;
-      // `<=` rather than `<`: adjacent ranges merge too. Sorted by offset, so
-      // `w.bitOffset >= back.bitOffset` and the hull starts at back's offset.
-      if (w.bitOffset <= backEnd) {
-        back.bitwidth =
-            std::max(backEnd, w.bitOffset + w.bitwidth) - back.bitOffset;
-        continue;
-      }
-    }
-    coalesced.push_back(w);
-  }
+  auto coalesced = coalesceRanges(std::move(merged));
+  memo->insert({feeder, coalesced});
   return coalesced;
 }
 
@@ -557,26 +648,59 @@ public:
                         driveOp.getValue().getType());
                     SmallVector<StringAttr> fieldNames;
                     if (narrowed && structTy) {
+                      // Each range must decompose into WHOLE fields, because
+                      // hw.struct_extract addresses a field, not a bit range.
+                      // A range may span several adjacent fields -- the mux
+                      // union coalesces adjacent writes into hulls (CVA6's
+                      // load_unit writes kill_req and tag_valid, adjacent
+                      // i1s, which arrive here as one 2-bit range) -- so
+                      // split each range back along field boundaries and
+                      // require the pieces to tile it exactly. Emit one
+                      // (field, range) pair per piece; abandon the narrowing
+                      // wholesale on any misalignment.
                       auto elements = structTy.getElements();
-                      for (auto &write : *narrowed) {
-                        uint64_t offset = hw::getBitWidth(structTy);
-                        StringAttr match;
-                        for (auto &element : elements) {
-                          auto fieldBw = hw::getBitWidth(element.type);
-                          if (fieldBw < 0)
-                            break;
-                          offset -= fieldBw;
-                          if (offset == write.bitOffset &&
-                              (uint64_t)fieldBw == write.bitwidth) {
-                            match = element.name;
+                      SmallVector<std::pair<uint64_t, uint64_t>> fieldRanges;
+                      uint64_t fieldOffset = hw::getBitWidth(structTy);
+                      bool valid = true;
+                      for (auto &element : elements) {
+                        auto fieldBw = hw::getBitWidth(element.type);
+                        if (fieldBw < 0) {
+                          valid = false;
+                          break;
+                        }
+                        fieldOffset -= fieldBw;
+                        fieldRanges.push_back(
+                            {fieldOffset, static_cast<uint64_t>(fieldBw)});
+                      }
+                      SmallVector<NarrowedWrite> split;
+                      if (valid) {
+                        for (auto &write : *narrowed) {
+                          uint64_t covered = 0;
+                          for (auto [i, fr] : llvm::enumerate(fieldRanges)) {
+                            auto [fo, fw] = fr;
+                            if (fo >= write.bitOffset &&
+                                fo + fw <= write.bitOffset + write.bitwidth) {
+                              split.push_back({fo, fw});
+                              fieldNames.push_back(elements[i].name);
+                              covered += fw;
+                            } else if (fo + fw > write.bitOffset &&
+                                       fo < write.bitOffset + write.bitwidth) {
+                              // Partially overlapping field: misaligned.
+                              valid = false;
+                              break;
+                            }
+                          }
+                          if (!valid || covered != write.bitwidth) {
+                            valid = false;
                             break;
                           }
                         }
-                        if (!match) {
-                          narrowed = std::nullopt;
-                          break;
-                        }
-                        fieldNames.push_back(match);
+                      }
+                      if (valid)
+                        *narrowed = std::move(split);
+                      else {
+                        narrowed = std::nullopt;
+                        fieldNames.clear();
                       }
                     }
                     if (narrowed) {
