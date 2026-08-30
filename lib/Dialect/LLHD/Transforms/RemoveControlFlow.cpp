@@ -10,6 +10,7 @@
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/LLHD/LLHDOps.h"
 #include "circt/Dialect/LLHD/LLHDPasses.h"
+#include "circt/Dialect/HW/HWOps.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/Matchers.h"
@@ -152,6 +153,209 @@ static Condition getBranchDecisionsFromDominatorToTarget(
 }
 
 //===----------------------------------------------------------------------===//
+// Ordered Drive Merging
+//===----------------------------------------------------------------------===//
+
+/// After control flow removal, a combinational body is a single block of
+/// drives in PROGRAM ORDER, with path conditions folded into enables. RTL
+/// like CVA6's return-address stack elaborates to a default whole-signal
+/// drive followed by conditional overrides of individual fields:
+///
+///   llhd.drv %stack_d, %stack_q after %t
+///   llhd.drv (sig.struct_extract (sig.array_get %stack_d[0]) "ra"),
+///            %data_i after %t if %push
+///
+/// Nothing downstream can consume this: CombineDrives groups drives by
+/// {delay, enable} and never merges across groups, and Sig2Reg refuses
+/// overlapping intervals outright. But within one sequential block the
+/// resolution is fully defined -- later drives win -- so this folds each
+/// root signal's ordered drives into ONE whole-signal drive whose value is
+/// built with struct_inject/array_inject and muxes.
+///
+/// Array slices are updated element-wise with array_get/array_inject rather
+/// than hw.array_concat, sidestepping any question of element order
+/// conventions in concat.
+
+/// Walk a drive target back to its root signal, collecting the projection
+/// ops along the way (leaf-to-root order). Returns the root ref value.
+static Value traceToRoot(Value ref, SmallVectorImpl<Operation *> &path) {
+  while (auto *defOp = ref.getDefiningOp()) {
+    if (isa<SigStructExtractOp, SigArrayGetOp, SigArraySliceOp, SigExtractOp>(
+            defOp)) {
+      path.push_back(defOp);
+      ref = defOp->getOperand(0);
+      continue;
+    }
+    break;
+  }
+  return ref;
+}
+
+/// Rebuild `whole` (a value of the root signal's type) with the slice
+/// addressed by `path` (leaf-to-root order, so iterate from the back)
+/// replaced by `value`. Returns null if a projection has a shape we do not
+/// handle (dynamic indices).
+static Value rebuildInject(OpBuilder &builder, Location loc, Value whole,
+                           ArrayRef<Operation *> path, Value value) {
+  if (path.empty())
+    return value;
+  Operation *step = path.back();
+  auto rest = path.drop_back();
+
+  if (auto op = dyn_cast<SigStructExtractOp>(step)) {
+    auto field = op.getFieldAttr();
+    Value child = hw::StructExtractOp::create(builder, loc, whole, field);
+    Value updated = rebuildInject(builder, loc, child, rest, value);
+    if (!updated)
+      return {};
+    return hw::StructInjectOp::create(builder, loc, whole, field, updated);
+  }
+  if (auto op = dyn_cast<SigArrayGetOp>(step)) {
+    // Only constant indices; a dynamic index would need a full demux.
+    if (!op.getIndex().getDefiningOp<hw::ConstantOp>())
+      return {};
+    Value child = hw::ArrayGetOp::create(builder, loc, whole, op.getIndex());
+    Value updated = rebuildInject(builder, loc, child, rest, value);
+    if (!updated)
+      return {};
+    return hw::ArrayInjectOp::create(builder, loc, whole, op.getIndex(),
+                                     updated);
+  }
+  if (auto op = dyn_cast<SigArraySliceOp>(step)) {
+    auto lowConst = op.getLowIndex().getDefiningOp<hw::ConstantOp>();
+    if (!lowConst)
+      return {};
+    auto sliceTy = cast<hw::ArrayType>(
+        cast<RefType>(op.getResult().getType()).getNestedType());
+    auto wholeTy = cast<hw::ArrayType>(whole.getType());
+    uint64_t low = lowConst.getValue().getZExtValue();
+    uint64_t len = sliceTy.getNumElements();
+    // Materialize the current slice value, recurse, then write the updated
+    // elements back one by one.
+    Value child = hw::ArraySliceOp::create(builder, loc, sliceTy, whole,
+                                           op.getLowIndex());
+    Value updated = rebuildInject(builder, loc, child, rest, value);
+    if (!updated)
+      return {};
+    Value result = whole;
+    unsigned wholeIdxWidth =
+        std::max(1u, llvm::Log2_64_Ceil(wholeTy.getNumElements()));
+    unsigned sliceIdxWidth =
+        std::max(1u, llvm::Log2_64_Ceil(sliceTy.getNumElements()));
+    for (uint64_t i = 0; i < len; ++i) {
+      Value sliceIdx =
+          hw::ConstantOp::create(builder, loc, APInt(sliceIdxWidth, i));
+      Value elem = hw::ArrayGetOp::create(builder, loc, updated, sliceIdx);
+      Value wholeIdx =
+          hw::ConstantOp::create(builder, loc, APInt(wholeIdxWidth, low + i));
+      result = hw::ArrayInjectOp::create(builder, loc, result, wholeIdx, elem);
+    }
+    return result;
+  }
+  if (auto op = dyn_cast<SigExtractOp>(step)) {
+    auto lowConst = op.getLowBit().getDefiningOp<hw::ConstantOp>();
+    if (!lowConst)
+      return {};
+    auto wholeWidth = hw::getBitWidth(whole.getType());
+    auto sliceWidth = hw::getBitWidth(
+        cast<RefType>(op.getResult().getType()).getNestedType());
+    if (wholeWidth <= 0 || sliceWidth <= 0 || !isa<IntegerType>(whole.getType()))
+      return {};
+    uint64_t low = lowConst.getValue().getZExtValue();
+    Value child = comb::ExtractOp::create(
+        builder, loc, builder.getIntegerType(sliceWidth), whole, low);
+    Value updated = rebuildInject(builder, loc, child, rest, value);
+    if (!updated)
+      return {};
+    // comb.concat's FIRST operand is the MSBs (measured convention, see
+    // Sig2RegPass).
+    SmallVector<Value> parts;
+    if (low + (uint64_t)sliceWidth < (uint64_t)wholeWidth)
+      parts.push_back(comb::ExtractOp::create(
+          builder, loc, builder.getIntegerType(wholeWidth - low - sliceWidth),
+          whole, low + sliceWidth));
+    parts.push_back(updated);
+    if (low > 0)
+      parts.push_back(comb::ExtractOp::create(
+          builder, loc, builder.getIntegerType(low), whole, 0));
+    if (parts.size() == 1)
+      return parts[0];
+    return comb::ConcatOp::create(builder, loc, parts);
+  }
+  return {};
+}
+
+/// Merge all drives in `block` that target the same root signal (directly or
+/// through constant projections) into a single whole-signal drive, resolving
+/// overlaps by program order.
+static void mergeOrderedDrives(Block *block) {
+  // Group the drives per root, preserving program order.
+  llvm::MapVector<Value, SmallVector<DriveOp>> byRoot;
+  for (auto driveOp : block->getOps<DriveOp>()) {
+    SmallVector<Operation *> path;
+    Value root = traceToRoot(driveOp.getSignal(), path);
+    byRoot[root].push_back(driveOp);
+  }
+
+  for (auto &[root, drives] : byRoot) {
+    if (drives.size() < 2)
+      continue;
+    // All drives must share the same delay; each projection chain must have
+    // constant indices (checked during rebuilding; abandon on failure).
+    Value delay = drives.front().getTime();
+    if (llvm::any_of(drives, [&](DriveOp op) { return op.getTime() != delay; }))
+      continue;
+
+    auto lastDrive = drives.back();
+    OpBuilder builder(lastDrive);
+    auto loc = lastDrive.getLoc();
+
+    // Resolve in program order. Seed with the signal's held value; if the
+    // first drive is whole-signal and unconditional (the usual default
+    // assignment), it replaces the seed outright and no probe is needed.
+    Value cur;
+    bool seeded = false;
+    {
+      SmallVector<Operation *> firstPath;
+      if (traceToRoot(drives.front().getSignal(), firstPath) == root &&
+          firstPath.empty() && !drives.front().getEnable()) {
+        cur = drives.front().getValue();
+        seeded = true;
+      } else {
+        cur = ProbeOp::create(builder, loc, root);
+      }
+    }
+
+    bool abandoned = false;
+    SmallVector<Operation *> newOps;
+    for (auto [idx, driveOp] : llvm::enumerate(drives)) {
+      if (seeded && idx == 0)
+        continue;
+      SmallVector<Operation *> path;
+      traceToRoot(driveOp.getSignal(), path);
+      Value updated =
+          rebuildInject(builder, loc, cur, path, driveOp.getValue());
+      if (!updated) {
+        abandoned = true;
+        break;
+      }
+      if (auto enable = driveOp.getEnable())
+        cur = comb::MuxOp::create(builder, loc, enable, updated, cur, true);
+      else
+        cur = updated;
+    }
+    if (abandoned)
+      continue;
+
+    LLVM_DEBUG(llvm::dbgs()
+               << "- Merged " << drives.size() << " ordered drives\n");
+    DriveOp::create(builder, loc, root, cur, delay, Value{});
+    for (auto driveOp : drives)
+      driveOp.erase();
+  }
+}
+
+//===----------------------------------------------------------------------===//
 // Control Flow Removal
 //===----------------------------------------------------------------------===//
 
@@ -192,8 +396,23 @@ void CFRemover::run() {
       sortedBlocks.push_back(ipoBlock);
     }
 
-    // Give up if there are any side-effecting ops in the region.
+    // Give up if there are any side-effecting ops in the region, except for
+    // signal drives and probes, which this pass now handles explicitly. A
+    // drive in a conditionally-executed block is rewritten into an
+    // unconditionally-executed drive whose ENABLE carries the block's path
+    // condition -- `llhd.drv ... if %cond` exists for exactly this. A probe
+    // only reads, and within one region execution reordering it relative to
+    // drives changes nothing: drives take effect a delta later, so probes
+    // read pre-region signal state either way.
+    //
+    // This is what lets an `always_comb` that assigns a default and then
+    // conditionally overrides fields of it -- CVA6's `ras` return-address
+    // stack, the hpdcache control blocks -- flatten to a single block, which
+    // in turn is the shape Sig2Reg's single-block transparency carve-out can
+    // promote.
     for (auto &op : block) {
+      if (isa<DriveOp, ProbeOp>(op))
+        continue;
       if (!isMemoryEffectFree(&op)) {
         LLVM_DEBUG(llvm::dbgs() << "- Has side effects, giving up\n");
         return;
@@ -350,6 +569,31 @@ void CFRemover::run() {
          llvm::zip(block->getArguments(), mergedArgs))
       blockArg.replaceAllUsesWith(mergedArg);
 
+    // Fold the path condition from the entry block into the enable of every
+    // drive in this block: the drive used to execute only when control
+    // reached the block, and after the merge it executes always. The
+    // condition values materialize at the entry terminator, which precedes
+    // the spliced ops; the AND itself is built at the drive, after its
+    // original enable's def.
+    if (block != entryBlock) {
+      SmallVector<DriveOp> drives(block->getOps<DriveOp>());
+      if (!drives.empty()) {
+        auto decision = getBranchDecisionsFromDominatorToTarget(
+            builder, entryBlock, block, decisionCache);
+        if (!decision.isTrue()) {
+          for (auto driveOp : drives) {
+            OpBuilder driveBuilder(driveOp);
+            Value cond =
+                decision.materialize(driveBuilder, driveOp.getLoc());
+            if (auto oldEnable = driveOp.getEnable())
+              cond = driveBuilder.createOrFold<comb::AndOp>(
+                  driveOp.getLoc(), oldEnable, cond, /*twoState=*/true);
+            driveOp.getEnableMutable().assign(cond);
+          }
+        }
+      }
+    }
+
     // Move all ops except for the terminator into the entry block.
     if (block != entryBlock)
       entryBlock->getOperations().splice(--entryBlock->end(),
@@ -388,6 +632,11 @@ struct RemoveControlFlowPass
 } // namespace
 
 void RemoveControlFlowPass::runOnOperation() {
-  for (auto op : getOperation().getOps<CombinationalOp>())
+  for (auto op : getOperation().getOps<CombinationalOp>()) {
     CFRemover(op.getBody()).run();
+    // If the body is (now) a single block, its drives execute in a defined
+    // program order; fold each signal's ordered drives into one.
+    if (op.getBody().hasOneBlock())
+      mergeOrderedDrives(&op.getBody().front());
+  }
 }
