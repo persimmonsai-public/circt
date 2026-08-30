@@ -262,6 +262,16 @@ struct DriveInfo {
   /// The optional reset that triggers a change of the driven value to a fixed
   /// reset value. Null if no reset was detected.
   ResetInfo reset;
+  /// An optional LEVEL condition gating clock-edge updates: the second
+  /// trigger of a two-trigger process, for a drive that sits in the
+  /// non-reset branch but has no reset behaviour of its own
+  /// (`if (!rst_n) <others> else q <= d;` where `q` is never reset). Unlike
+  /// `reset` this does NOT become an async reset pin on the register; it is
+  /// folded into the enable, so the register holds while the sibling drives
+  /// are being reset -- exactly what the RTL says.
+  Value gate;
+  /// The level of `gate` at which updates are allowed.
+  bool gateWhenHigh;
 
   DriveInfo() {}
   explicit DriveInfo(DriveOp op) : op(op) {}

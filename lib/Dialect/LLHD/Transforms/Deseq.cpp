@@ -1160,8 +1160,9 @@ bool Deseq::matchDriveClockAndReset(
     DriveInfo &drive, ArrayRef<std::pair<DNFTerm, ValueEntry>> valueTable) {
   // We need two or three entries in the value table to represent a register
   // with reset. A table with two entries means that the clock edge while reset
-  // is inactive has no drive, which is a hold.
-  if (valueTable.size() != 2 && valueTable.size() != 3) {
+  // is inactive has no drive, which is a hold. A SINGLE entry means the drive
+  // does not participate in the reset at all; see below.
+  if (valueTable.empty() || valueTable.size() > 3) {
     LLVM_DEBUG(llvm::dbgs() << "- Aborting: two trigger value table has "
                             << valueTable.size() << " entries\n");
     return false;
@@ -1193,6 +1194,52 @@ bool Deseq::matchDriveClockAndReset(
     auto clockWhileReset = DNFTerm{clockEdge | resetOn};
     auto clockWithoutEnable = DNFTerm{clockEdge | resetOff};
     auto clockWithEnable = DNFTerm{clockEdge | resetOff | 0b01};
+
+    // A single entry that matches the clock edge with the reset INACTIVE is a
+    // drive in the process's non-reset branch with no reset behaviour of its
+    // own: an ordinary enabled register that happens to share a process with
+    // reset-carrying siblings. CVA6's `tc_sram` is the archetype --
+    // `if (!rst_ni) <other regs> else ... rdata_q <= wdata;` -- and its whole
+    // memory array used to be refused over this.
+    //
+    // Record the reset trigger as a GATE (a level folded into the enable),
+    // not as a reset: the register must hold while the reset is active, and
+    // an async reset pin would instead force a value. Two invariants carried
+    // by `implementRegister` make this correct, and both were learned the
+    // hard way:
+    //  * `specializeProcess` requires EVERY observed trigger to be fixed --
+    //    handing it only the clock leaves a wait-destination block argument
+    //    mapped to a null Value and crashes in `Operation::create`. The gate
+    //    is therefore fixed at its allowed level during specialization,
+    //    which is the same FixedValues entry the sibling reset drives use.
+    //  * Fixing the gate folds the enable's dependence on the reset signal
+    //    to a constant, so the reset level must be re-ANDed into the enable
+    //    OUTSIDE the process; otherwise the register would update during
+    //    reset, which the RTL does not.
+    if (valueTable.size() == 1) {
+      auto &entry = valueTable[0];
+      if (entry.first != clockWithoutEnable && entry.first != clockWithEnable)
+        continue;
+
+      drive.clock.clock = triggers[clockIdx].getProjected();
+      drive.clock.risingEdge = !negClock;
+      drive.clock.value = drive.op.getValue();
+      if (!entry.second.isUnknown())
+        drive.clock.value = entry.second.value;
+      if (entry.first == clockWithEnable)
+        drive.clock.enable = drive.op.getEnable();
+      drive.gate = triggers[resetIdx].getProjected();
+      drive.gateWhenHigh = negReset;
+
+      LLVM_DEBUG({
+        llvm::dbgs() << "  - Matched " << (negClock ? "neg" : "pos")
+                     << "edge clock ";
+        drive.clock.clock.printAsOperand(llvm::dbgs(), OpPrintingFlags());
+        llvm::dbgs() << " -> " << entry.second
+                     << " (no reset; gated on reset inactive)\n";
+      });
+      return true;
+    }
 
     // Find the entries corresponding to the above conditions.
     auto resetIt = llvm::find_if(
@@ -1449,17 +1496,43 @@ void Deseq::implementRegister(DriveInfo &drive) {
   }
 
   // Specialize the process for the clock trigger, which will produce the
-  // enable and the value for regular clock edges.
+  // enable and the value for regular clock edges. Every observed trigger must
+  // appear in `fixedValues`: `specializeProcess` maps the wait destination's
+  // block arguments through `materializedFixedValues`, and an uncovered
+  // trigger comes back as a null Value. A gated drive fixes its gate at the
+  // allowed level -- the identical entry its sibling reset drives use, so the
+  // specializations share a cache entry.
   FixedValues fixedValues;
   fixedValues.push_back(
       {drive.clock.clock, !drive.clock.risingEdge, drive.clock.risingEdge});
   if (drive.reset)
     fixedValues.push_back(
         {drive.reset.reset, !drive.reset.activeHigh, !drive.reset.activeHigh});
+  else if (drive.gate)
+    fixedValues.push_back(
+        {drive.gate, drive.gateWhenHigh, drive.gateWhenHigh});
 
   value = specializeValue(value, fixedValues);
   if (enable)
     enable = specializeValue(enable, fixedValues);
+
+  // Specialization has just folded the gate to a constant inside the enable
+  // and the value, so the gate level must be re-applied OUTSIDE the process:
+  // materialize the gate signal next to the register and AND it into the
+  // enable. Without this the register would update during reset.
+  if (drive.gate) {
+    Value gateValue =
+        materializeProjection(builder, loc, drive.gate, rematerialized);
+    if (!drive.gateWhenHigh) {
+      auto one = hw::ConstantOp::create(builder, loc, builder.getI1Type(), 1);
+      gateValue = comb::XorOp::create(builder, loc, gateValue, one,
+                                      /*twoState=*/true);
+    }
+    enable = enable ? comb::AndOp::create(builder, loc, enable, gateValue,
+                                          /*twoState=*/true)
+                          .getResult()
+                    : gateValue;
+  }
 
   // Try to guess a name for the register.
   StringAttr name;
