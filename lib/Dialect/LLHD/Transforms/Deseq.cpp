@@ -1088,6 +1088,11 @@ bool Deseq::matchDrive(DriveInfo &drive) {
     return false;
   }
 
+  LLVM_DEBUG({
+    for (auto &[term, value] : valueTable)
+      llvm::dbgs() << "  - Spread entry: " << term << " -> " << value << "\n";
+  });
+
   // If we have two triggers, one of them must be the reset.
   if (triggers.size() == 2)
     return matchDriveClockAndReset(drive, valueTable);
@@ -1249,8 +1254,57 @@ bool Deseq::matchDriveClockAndReset(
 
     auto clockWhileResetIt = llvm::find_if(
         valueTable, [&](auto &pair) { return pair.first == clockWhileReset; });
-    if (clockWhileResetIt == valueTable.end())
+    if (clockWhileResetIt == valueTable.end()) {
+      // A register whose clock value EQUALS its reset value collapses the
+      // table: the boolean analysis merges `clockEdge&resetOn -> v` and
+      // `clockEdge&resetOff -> v` into a single reset-level-free
+      // `clockEdge -> v` term, which none of the patterns above carry.
+      // CVA6's csr_regfile hits this through config-constant registers
+      // (`en_ld_st_translation_q` is tied off on a config without an MMU),
+      // and ONE such drive used to take all 21 matched siblings down with
+      // it, since a process lowers all-or-nothing.
+      //
+      // Implementable as an ordinary async-reset register iff the two
+      // values are KNOWN and equal: on a clock edge with reset active the
+      // hardware's reset wins and produces the reset value, which by
+      // equality is exactly what the table demands. The same argument
+      // covers the enabled form: with the enable low the register holds,
+      // and what it holds while reset is active is the reset value.
+      if (valueTable.size() == 2) {
+        auto clockAnyReset = DNFTerm{clockEdge};
+        auto clockAnyResetEnable = DNFTerm{clockEdge | 0b01};
+        auto clockIt = llvm::find_if(valueTable, [&](auto &pair) {
+          return pair.first == clockAnyReset ||
+                 pair.first == clockAnyResetEnable;
+        });
+        if (clockIt != valueTable.end() && !resetIt->second.isUnknown() &&
+            clockIt->second == resetIt->second) {
+          drive.reset.reset = triggers[resetIdx].getProjected();
+          drive.reset.value = resetIt->second.value;
+          drive.reset.activeHigh = !negReset;
+
+          drive.clock.clock = triggers[clockIdx].getProjected();
+          drive.clock.risingEdge = !negClock;
+          drive.clock.value = clockIt->second.value;
+          if (clockIt->first == clockAnyResetEnable)
+            drive.clock.enable = drive.op.getEnable();
+
+          LLVM_DEBUG({
+            llvm::dbgs() << "  - Matched " << (negClock ? "neg" : "pos")
+                         << "edge clock ";
+            drive.clock.clock.printAsOperand(llvm::dbgs(), OpPrintingFlags());
+            llvm::dbgs() << " -> " << clockIt->second
+                         << " (clock value equals reset value)\n";
+            llvm::dbgs() << "  - Matched active-" << (negReset ? "low" : "high")
+                         << " reset ";
+            drive.reset.reset.printAsOperand(llvm::dbgs(), OpPrintingFlags());
+            llvm::dbgs() << " -> " << resetIt->second << "\n";
+          });
+          return true;
+        }
+      }
       continue;
+    }
 
     auto clockIt = llvm::find_if(valueTable, [&](auto &pair) {
       return pair.first == clockWithoutEnable || pair.first == clockWithEnable;
