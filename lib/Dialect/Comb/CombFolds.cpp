@@ -576,6 +576,14 @@ extractConcatToConcatExtract(ExtractOp op, ConcatOp innerCat,
   }
 
   if (reverseConcatArgs.size() == 1) {
+    // In a graph region the concat may (transitively) use this very extract:
+    // `%e = extract(%c); %c = concat(..., %e, ...)` is how a partial-update
+    // false loop looks after aggregates are lowered to bit vectors. If the
+    // extract selects exactly its own result out of the concat, the
+    // "replacement" IS the op -- a self-RAUW leaves the uses in place and
+    // eraseOp asserts. Bail; there is nothing to simplify.
+    if (reverseConcatArgs[0] == op.getResult())
+      return failure();
     replaceOpAndCopyNamehint(rewriter, op, reverseConcatArgs[0]);
   } else {
     replaceOpWithNewOpAndCopyNamehint<ConcatOp>(
