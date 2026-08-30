@@ -248,6 +248,48 @@ bool Loop::match() {
       }
     }
 
+    // Eliminate trivially loop-invariant header phis before checking for
+    // outside uses. A header block argument that receives the same value V
+    // on every entry edge and itself (or V) from the latch is just V --
+    // store_buffer carries its loop-invariant page offset that way and then
+    // reads it in the join block, which would otherwise trip the outside-use
+    // check below even though nothing iteration-dependent escapes. Replacing
+    // the arg with V is sound wherever the arg was usable: MLIR verified
+    // every existing use as dominated by the header, and a V that reaches
+    // the header on every path dominates everything the header dominates.
+    // Only values defined outside this region's loop blocks entirely are
+    // accepted, sidestepping the need for dominance analysis here.
+    auto *headerBlock = cfgLoop.getHeader();
+    for (auto arg : headerBlock->getArguments()) {
+      Value common;
+      bool trivial = true;
+      for (auto &use : headerBlock->getUses()) {
+        auto branchOp = dyn_cast<BranchOpInterface>(use.getOwner());
+        if (!branchOp) {
+          trivial = false;
+          break;
+        }
+        Value incoming = branchOp.getSuccessorOperands(
+            use.getOperandNumber())[arg.getArgNumber()];
+        if (incoming == arg)
+          continue;
+        if (common && incoming != common) {
+          trivial = false;
+          break;
+        }
+        common = incoming;
+      }
+      if (!trivial || !common)
+        continue;
+      if (auto *defOp = common.getDefiningOp())
+        if (bodySet.contains(defOp->getBlock()))
+          continue;
+      if (auto barg = dyn_cast<BlockArgument>(common))
+        if (bodySet.contains(barg.getOwner()))
+          continue;
+      arg.replaceAllUsesWith(common);
+    }
+
     for (auto *block : bodyList) {
       auto checkUsers = [&](Value value) {
         for (auto *user : value.getUsers())
