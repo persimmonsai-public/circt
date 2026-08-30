@@ -16,6 +16,7 @@
 #include "circt/Dialect/LLHD/LLHDTypes.h"
 #include "circt/Support/LLVM.h"
 #include "mlir/IR/DialectImplementation.h"
+#include "mlir/Interfaces/FoldInterfaces.h"
 #include "mlir/Transforms/InliningUtils.h"
 
 using namespace circt;
@@ -49,6 +50,23 @@ struct LLHDInlinerInterface : public mlir::DialectInlinerInterface {
 // LLHD Dialect
 //===----------------------------------------------------------------------===//
 
+namespace {
+/// Constants folded from values inside an `llhd.process`, `llhd.combinational`
+/// or `llhd.final` region must materialize INSIDE that region: `llhd.wait`
+/// (and `llhd.halt`) verify that their operands are defined within the
+/// region, so the folder's default behaviour -- hoisting constants to the
+/// nearest isolated-from-above region, the hw.module -- breaks any process
+/// whose yield operand folds to a constant ("'llhd.wait' op using value
+/// defined outside the region", seen on OpenC910's ct_ebiu_write_channel the
+/// moment surrounding IR changes enabled such a fold).
+struct LLHDFoldInterface : public mlir::DialectFoldInterface {
+  using DialectFoldInterface::DialectFoldInterface;
+  bool shouldMaterializeInto(Region *region) const final {
+    return isa<ProcessOp, CombinationalOp, FinalOp>(region->getParentOp());
+  }
+};
+} // namespace
+
 void LLHDDialect::initialize() {
   registerTypes();
   registerAttributes();
@@ -58,7 +76,7 @@ void LLHDDialect::initialize() {
 #include "circt/Dialect/LLHD/LLHD.cpp.inc"
       >();
 
-  addInterfaces<LLHDInlinerInterface>();
+  addInterfaces<LLHDInlinerInterface, LLHDFoldInterface>();
 
   mlir::DialectRegistry registry;
   registerDestructableIntegerExternalModel(registry);
