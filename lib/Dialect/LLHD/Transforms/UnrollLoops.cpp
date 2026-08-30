@@ -127,6 +127,22 @@ struct Loop {
   APInt endBound;
   /// The number of iterations of the loop.
   unsigned tripCount = 0;
+  /// The blocks to replicate per iteration AS OF MATCH TIME, in region
+  /// order: the natural loop's blocks plus any absorbed single-predecessor
+  /// early-exit destinations (see `match`). Used only by the match-time
+  /// analysis. `unroll` must NOT use this as the clone set: nested loops
+  /// unroll inner-first within the same round, and an inner unroll clones
+  /// new blocks into this loop's body -- `addBasicBlockToLoop` records them
+  /// in `cfgLoop`, which a match-time snapshot cannot see. `unroll`
+  /// recomputes the natural part from `cfgLoop.contains()` and adds only
+  /// `absorbed`.
+  SmallVector<Block *> bodyList;
+  llvm::SmallPtrSet<Block *, 8> bodySet;
+  /// Only the absorbed early-exit blocks. These are straight-line
+  /// single-predecessor chains hanging off the loop, which no sibling or
+  /// nested unroll can restructure, so a match-time snapshot of them stays
+  /// valid.
+  llvm::SmallPtrSet<Block *, 4> absorbed;
 };
 } // namespace
 
@@ -148,15 +164,108 @@ bool Loop::failMatch(const Twine &msg) const {
 /// Check that the loop matches the specific pattern we understand, and extract
 /// the loop condition and induction variable.
 bool Loop::match() {
-  // Ensure that there is a unique exit point and condition for the loop.
+  // Collect the blocks to replicate, in region order for determinism.
+  for (auto &block : *cfgLoop.getHeader()->getParent())
+    if (cfgLoop.contains(&block)) {
+      bodyList.push_back(&block);
+      bodySet.insert(&block);
+    }
+
+  // Find the edges leaving the body.
+  auto collectExits = [&](SmallVectorImpl<BlockOperand *> &exits) {
+    exits.clear();
+    for (auto *block : bodyList)
+      for (auto &edge : block->getTerminator()->getBlockOperands())
+        if (!bodySet.contains(edge.get()))
+          exits.push_back(&edge);
+  };
   SmallVector<BlockOperand *> exits;
-  for (auto *block : cfgLoop.getBlocks())
-    for (auto &edge : block->getTerminator()->getBlockOperands())
-      if (!cfgLoop.contains(edge.get()))
-        exits.push_back(&edge);
-  if (exits.size() != 1)
-    return failMatch("multiple exits");
-  exitEdge = exits.back();
+  collectExits(exits);
+  if (exits.empty())
+    return failMatch("no exit");
+
+  if (exits.size() == 1) {
+    // The single-exit case, unchanged: only the final iteration keeps the
+    // exit branch, so values defined in the original (last-iteration) blocks
+    // still dominate any uses past the exit and no further checking is
+    // needed.
+    exitEdge = exits.back();
+  } else {
+    // Multiple exits: one bounds the trip count (the induction exit, `i < N`
+    // tested in the header) and the rest are data-dependent early breaks --
+    // the `for (i...) if (hit) begin ...; break; end` idiom of RTL search
+    // loops. `unroll` needs no special handling for the break branches
+    // themselves: it only rewrites the INDUCTION exit per iteration, and a
+    // break is an ordinary terminator each cloned iteration keeps, branching
+    // to the same out-of-loop join with its own block operands.
+    //
+    // What it DOES need is that nothing outside the replicated body reads a
+    // value defined inside it. With a single exit that holds by construction
+    // (see above); with early breaks it can fail two ways, and both are
+    // handled below:
+    //
+    //  1. The hit block. `if (hit) begin out = data[i]; break; end` puts the
+    //     assignment in a block that branches straight out of the loop, so it
+    //     is NOT part of the natural loop -- yet it reads per-iteration
+    //     values. Every cloned iteration would branch to the one original
+    //     copy, dominated by none of them. Since such a block has a single
+    //     predecessor, the fix is to ABSORB it into the replicated body (to a
+    //     fixpoint, since hit blocks can chain).
+    //
+    //  2. Anything else. If a value defined in the (extended) body still has
+    //     a user outside it, replication would need to thread it through
+    //     per-iteration block arguments, which `unroll` does not do. Refuse;
+    //     getting this silently wrong is a dominance error at best and a
+    //     miscompile at worst.
+    auto *header = cfgLoop.getHeader();
+    BlockOperand *inductionExit = nullptr;
+    for (auto *edge : exits) {
+      if (edge->getOwner()->getBlock() != header)
+        continue;
+      if (inductionExit)
+        return failMatch("multiple exits from the loop header");
+      inductionExit = edge;
+    }
+    if (!inductionExit)
+      return failMatch("no exit from the loop header");
+    Block *inductionDest = inductionExit->get();
+
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      collectExits(exits);
+      for (auto *edge : exits) {
+        Block *dest = edge->get();
+        if (edge->getOwner()->getBlock() == header || dest == inductionDest)
+          continue;
+        if (!dest->getSinglePredecessor())
+          continue;
+        bodyList.push_back(dest);
+        bodySet.insert(dest);
+        absorbed.insert(dest);
+        changed = true;
+        break; // restart: absorbing changes the exit set
+      }
+    }
+
+    for (auto *block : bodyList) {
+      auto checkUsers = [&](Value value) {
+        for (auto *user : value.getUsers())
+          if (!bodySet.contains(user->getBlock()))
+            return false;
+        return true;
+      };
+      for (auto arg : block->getArguments())
+        if (!checkUsers(arg))
+          return failMatch("block argument used outside the loop");
+      for (auto &op : *block)
+        for (auto result : op.getResults())
+          if (!checkUsers(result))
+            return failMatch("op result used outside the loop");
+    }
+
+    exitEdge = inductionExit;
+  }
 
   // The terminator doing the exit must be a conditional branch.
   auto exitBranch = dyn_cast<cf::CondBranchOp>(exitEdge->getOwner());
@@ -277,7 +386,7 @@ void Loop::unroll(CFGLoopInfo &cfgLoopInfo) {
   auto *header = cfgLoop.getHeader();
   SmallVector<Block *> orderedBody;
   for (auto &block : *header->getParent())
-    if (cfgLoop.contains(&block))
+    if (cfgLoop.contains(&block) || absorbed.contains(&block))
       orderedBody.push_back(&block);
 
   // Copy the loop body for every iteration of the loop.
@@ -327,10 +436,12 @@ void Loop::unroll(CFGLoopInfo &cfgLoopInfo) {
     pruner.eraseLaterIfUnused(exitBranchOp.getOperands());
     exitBranchOp.erase();
 
-    // Add the new blocks to the loop body.
+    // Add the new blocks to the loop body. Absorbed early-exit blocks are
+    // not part of the natural loop, so their clones are not registered.
     for (auto *block : orderedBody) {
       auto *newBlock = mapper.lookup(block);
-      cfgLoop.addBasicBlockToLoop(newBlock, cfgLoopInfo);
+      if (cfgLoop.contains(block))
+        cfgLoop.addBasicBlockToLoop(newBlock, cfgLoopInfo);
     }
 
     // Increment the induction variable value.
@@ -469,7 +580,10 @@ bool UnrollLoopsPass::unrollLoops(Operation *op, Region &body) {
   // header, and the latch block has a back-edge to a single header. Create a
   // data structure for each loop we can potentially unroll. The loops are in
   // preorder, with outer loops appearing before their child loops.
-  SmallVector<Loop> loops;
+  // `Loop` now carries its body set inline, so give the vector an explicit
+  // (zero) inline element count rather than tripping SmallVector's
+  // default-storage size assertion.
+  SmallVector<Loop, 0> loops;
   bool retry = false;
   for (auto *cfgLoop : cfgLoopInfo.getLoopsInPreorder()) {
     // To simplify unrolling we need a unique latch block branching back to the
