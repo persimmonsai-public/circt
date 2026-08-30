@@ -765,6 +765,20 @@ TruthTable Deseq::computeBoolean(OpResult value) {
     return result;
   }
 
+  // Results of state elements and other opaque defs -- registers, signal
+  // probes, instance outputs -- are FREE INPUTS to this analysis: their value
+  // at process-evaluation time does not combinationally depend on the current
+  // trigger event, even when their own input cone mentions the trigger
+  // signals. The generic fallback below would chase THROUGH them into that
+  // cone and report poison. OpenC910's ct_ebiu_write_channel is the found
+  // case: an earlier process in the same module has already been lowered to
+  //   %aw_vb_sel = seq.firreg (xor %en, %aw_vb_sel) ... reset (xor %rst, 1)
+  // and a later process's drive enable reads %aw_vb_sel -- the reset wiring
+  // mentions the analyzed process's own reset trigger, so the whole module
+  // was refused over a value that is simply "some register's current state".
+  if (isa<seq::FirRegOp, seq::CompRegOp, llhd::ProbeOp, hw::InstanceOp>(op))
+    return getUnknownBoolean();
+
   // Otherwise check if the operation depends on any of the triggers. If it
   // does, create a poison value since we don't really know how the trigger
   // affects this boolean. If it doesn't, create an unknown value.
@@ -776,8 +790,11 @@ TruthTable Deseq::computeBoolean(OpResult value) {
         auto result = computeBoolean(operand);
         return result.isPoison() || (result != getUnknownBoolean() &&
                                      !result.isTrue() && !result.isFalse());
-      }))
+      })) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "  - Poison boolean at unsupported op: " << *op << "\n");
     return getPoisonBoolean();
+  }
   return getUnknownBoolean();
 }
 
