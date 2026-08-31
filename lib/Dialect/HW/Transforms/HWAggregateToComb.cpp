@@ -163,39 +163,38 @@ struct HWArrayInjectOpConversion : OpConversionPattern<hw::ArrayInjectOp> {
           loc, inputArray, i * elemWidth, elemWidth));
     }
 
-    // Create 2D array: each row represents what the array would look like
-    // if injection happened at that specific index
-    SmallVector<Value> arrayRows;
-    arrayRows.reserve(numElements);
-    for (int injectIdx = numElements - 1; injectIdx >= 0; --injectIdx) {
-      SmallVector<Value> rowElements;
-      rowElements.reserve(numElements);
-
-      // Build the row: array[n-1], array[n-2], ..., but replace element at
-      // injectIdx with newVal
-      for (int originalIdx = numElements - 1; originalIdx >= 0; --originalIdx) {
-        if (originalIdx == injectIdx) {
-          rowElements.push_back(adaptor.getElement());
-        } else {
-          rowElements.push_back(originalElements[originalIdx]);
-        }
-      }
-
-      // Concatenate elements to form this row
-      Value row = hw::ArrayCreateOp::create(rewriter, loc, rowElements);
-      arrayRows.push_back(row);
+    // Per-element select: out[i] = (index == i) ? newVal : old[i].
+    // The previous implementation materialized an N x N "row per possible
+    // inject index" matrix and selected a row with array_get -- O(N^2)
+    // intermediate bits, which both blows quadratically past MLIR's
+    // 16,777,215-bit IntegerType cap on real memories (CVA6 cv64a6's
+    // wt_dcache_mem holds an array<256 x array<8xi44>> whose matrix would
+    // be 23M bits) and wastes ABC's time even when it fits. The linear
+    // form is N compares + N muxes.
+    if (numElements == 1) {
+      // Single-element array: the (zero-width) index can only name
+      // element 0, so injection always replaces the whole array.
+      rewriter.replaceOp(op, adaptor.getElement());
+      return success();
     }
 
-    // Create the 2D array by concatenating all rows
-    // arrayRows[0] corresponds to injection at index 0
-    // arrayRows[1] corresponds to injection at index 1, etc.
-    Value array2D = hw::ArrayCreateOp::create(rewriter, loc, arrayRows);
-
-    // Create array_get operation to select the row
-    auto arrayGetOp =
-        hw::ArrayGetOp::create(rewriter, loc, array2D, adaptor.getIndex());
-
-    rewriter.replaceOp(op, arrayGetOp);
+    Value index = adaptor.getIndex();
+    SmallVector<Value> newElements;
+    newElements.reserve(numElements);
+    // comb.concat places its first operand at the MSBs; element N-1
+    // occupies the MSBs of the lowered array, matching the extraction
+    // convention above (element i lives at [i*elemWidth, (i+1)*elemWidth)).
+    for (int i = numElements - 1; i >= 0; --i) {
+      Value idxConst = hw::ConstantOp::create(
+          rewriter, loc,
+          APInt(cast<IntegerType>(index.getType()).getWidth(), i));
+      Value isInject = comb::ICmpOp::create(
+          rewriter, loc, comb::ICmpPredicate::eq, index, idxConst);
+      newElements.push_back(comb::MuxOp::create(rewriter, loc, isInject,
+                                                adaptor.getElement(),
+                                                originalElements[i]));
+    }
+    rewriter.replaceOpWithNewOp<comb::ConcatOp>(op, newElements);
     return success();
   }
 };
