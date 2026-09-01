@@ -542,11 +542,22 @@ void Loop::unroll(CFGLoopInfo &cfgLoopInfo) {
     exitBranchOp.erase();
 
     // Add the new blocks to the loop body. Absorbed early-exit blocks are
-    // not part of the natural loop, so their clones are not registered.
+    // not part of THIS natural loop -- but if the original sits inside an
+    // ENCLOSING loop, its clones must be registered there: a later unroll
+    // of that outer loop derives its clone set from cfgLoopInfo
+    // membership, and unregistered clones would be left SHARED across the
+    // outer iterations, still referencing values of an inner-loop body
+    // that the final-iteration cleanup then erases ("null operand found").
+    // Found via cv64a6/cv32a60x's hpdcache_rtab: an inlined early-return
+    // function (`return ptr_t'(i)`) inside a nested write loop -- the
+    // inner unroll's absorbed hit-block clones vanished from the outer
+    // loop's view.
     for (auto *block : orderedBody) {
       auto *newBlock = mapper.lookup(block);
       if (cfgLoop.contains(block))
         cfgLoop.addBasicBlockToLoop(newBlock, cfgLoopInfo);
+      else if (auto *enclosing = cfgLoopInfo.getLoopFor(block))
+        enclosing->addBasicBlockToLoop(newBlock, cfgLoopInfo);
     }
 
     // Increment the induction variable value.
