@@ -718,6 +718,34 @@ public:
                               b, driveOp.getLoc(), driveOp.getValue(),
                               fieldNames[writeIdx]);
                         } else if (isArray) {
+                          // coalesceRanges may have merged ADJACENT element
+                          // writes into one multi-element range; a single
+                          // array_get only covers elemBw of it, and the
+                          // reconstruction would bitcast that one element to
+                          // the full range width (i32 -> i1024 on a fully
+                          // written 32x32 regfile -- an invalid op). Mirror
+                          // the struct path's boundary splitting: emit one
+                          // interval per element of the range. The single-
+                          // element case falls through to the shared
+                          // emplace_back below unchanged.
+                          if (write.bitwidth > (uint64_t)elemBw) {
+                            for (uint64_t off = write.bitOffset;
+                                 off < write.bitOffset + write.bitwidth;
+                                 off += elemBw) {
+                              Value idx = hw::ConstantOp::create(
+                                  b, driveOp.getLoc(),
+                                  APInt(llvm::Log2_64_Ceil(
+                                            arrayTy.getNumElements()),
+                                        off / elemBw));
+                              Value subElem = hw::ArrayGetOp::create(
+                                  b, driveOp.getLoc(), driveOp.getValue(),
+                                  idx);
+                              intervals.emplace_back(
+                                  Offset(off), (uint64_t)elemBw, subElem,
+                                  curr->getBlock(), timeOp.getValueAttr());
+                            }
+                            continue;
+                          }
                           uint64_t index = write.bitOffset / elemBw;
                           Value idx = hw::ConstantOp::create(
                               b, driveOp.getLoc(),
