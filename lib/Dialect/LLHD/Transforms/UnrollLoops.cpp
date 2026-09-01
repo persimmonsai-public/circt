@@ -290,6 +290,69 @@ bool Loop::match() {
       arg.replaceAllUsesWith(common);
     }
 
+    // LCSSA-style live-out threading. A loop-defined value used after the
+    // loop is real (not just phi noise) when the code asks something about
+    // the state the loop ended in -- the canonical idiom is checking the
+    // induction variable after a break-able loop (`if (i == N)`: fell off
+    // the end vs. broke early; CVA6's PMP match loop does exactly this).
+    // Such a use is fine to unroll IF the value can be handed out along
+    // every exit edge instead: append it to each branch into the exit
+    // destination and rewrite the destination's uses to a fresh block
+    // argument. Each cloned iteration's exit branch then passes that
+    // iteration's value -- exactly the break semantics. Conservatively
+    // limited to values whose every outside use sits DIRECTLY in one
+    // destination block, all of whose predecessors are loop blocks
+    // terminating in a BranchOpInterface; anything else still falls
+    // through to the failMatch below. Pure phi threading: safe even if
+    // the overall match later fails for another reason.
+    {
+      SmallVector<std::pair<Value, Block *>> toThread;
+      auto gatherThreadable = [&](Value value) {
+        SmallVector<OpOperand *> outside;
+        for (auto &use : value.getUses())
+          if (!bodySet.contains(use.getOwner()->getBlock()))
+            outside.push_back(&use);
+        if (outside.empty())
+          return true;
+        Block *dest = outside.front()->getOwner()->getBlock();
+        for (auto *use : outside)
+          if (use->getOwner()->getBlock() != dest)
+            return false;
+        for (Block *pred : dest->getPredecessors())
+          if (!bodySet.contains(pred) ||
+              !isa<BranchOpInterface>(pred->getTerminator()))
+            return false;
+        toThread.push_back({value, dest});
+        return true;
+      };
+      bool threadable = true;
+      for (auto *block : bodyList) {
+        for (auto arg : block->getArguments())
+          threadable &= gatherThreadable(arg);
+        for (auto &op : *block)
+          for (auto result : op.getResults())
+            threadable &= gatherThreadable(result);
+      }
+      if (threadable) {
+        for (auto [value, dest] : toThread) {
+          BlockArgument newArg =
+              dest->addArgument(value.getType(), value.getLoc());
+          llvm::SmallPtrSet<Block *, 4> seenPreds;
+          for (Block *pred : dest->getPredecessors()) {
+            if (!seenPreds.insert(pred).second)
+              continue;
+            auto branch = cast<BranchOpInterface>(pred->getTerminator());
+            for (unsigned i = 0, e = branch->getNumSuccessors(); i != e; ++i)
+              if (branch->getSuccessor(i) == dest)
+                branch.getSuccessorOperands(i).append(ValueRange{value});
+          }
+          value.replaceUsesWithIf(newArg, [&](OpOperand &use) {
+            return use.getOwner()->getBlock() == dest;
+          });
+        }
+      }
+    }
+
     for (auto *block : bodyList) {
       auto checkUsers = [&](Value value) {
         for (auto *user : value.getUsers())

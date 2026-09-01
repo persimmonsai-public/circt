@@ -1269,6 +1269,53 @@ bool Deseq::matchDriveClockAndReset(
     if (resetIt == valueTable.end())
       continue;
 
+    // A table whose entries ALL map to one identical known value v -- the
+    // reset entry included -- where every non-reset entry only fires on a
+    // clock edge (its AND-mask contains the clock-edge literals; extra
+    // literals such as an unknown enable or either reset level only narrow
+    // it) is a constant-v register regardless of the table's exact shape.
+    // A register that loads v on EVERY clock edge and resets to v is
+    // observationally identical: narrower entries merely write v less
+    // often, and what the register holds in between is already v (same
+    // power-up caveat the clock-equals-reset rule below accepts). This
+    // must run BEFORE the clockWhileReset dispatch: cv64a6's
+    // issue_read_operands `is_zcmt_o` spells the shape as
+    // {clockEdge&resetActive -> v, resetEdge -> v, clockEdge&xEnable -> v},
+    // whose first entry IS clockWhileReset, steering the specific-pattern
+    // path below into a refusal.
+    if (!resetIt->second.isUnknown()) {
+      auto v = resetIt->second;
+      bool allSameAndClocked = llvm::all_of(valueTable, [&](auto &pair) {
+        if (pair.second.isUnknown() || !(pair.second == v))
+          return false;
+        if (pair.first == reset)
+          return true;
+        return (pair.first.andTerms & clockEdge) == clockEdge;
+      });
+      if (allSameAndClocked) {
+        drive.reset.reset = triggers[resetIdx].getProjected();
+        drive.reset.value = v.value;
+        drive.reset.activeHigh = !negReset;
+
+        drive.clock.clock = triggers[clockIdx].getProjected();
+        drive.clock.risingEdge = !negClock;
+        drive.clock.value = v.value;
+
+        LLVM_DEBUG({
+          llvm::dbgs() << "  - Matched " << (negClock ? "neg" : "pos")
+                       << "edge clock ";
+          drive.clock.clock.printAsOperand(llvm::dbgs(), OpPrintingFlags());
+          llvm::dbgs() << " -> " << v
+                       << " (all table entries equal reset value)\n";
+          llvm::dbgs() << "  - Matched active-" << (negReset ? "low" : "high")
+                       << " reset ";
+          drive.reset.reset.printAsOperand(llvm::dbgs(), OpPrintingFlags());
+          llvm::dbgs() << " -> " << v << "\n";
+        });
+        return true;
+      }
+    }
+
     auto clockWhileResetIt = llvm::find_if(
         valueTable, [&](auto &pair) { return pair.first == clockWhileReset; });
     if (clockWhileResetIt == valueTable.end()) {
@@ -1320,6 +1367,7 @@ bool Deseq::matchDriveClockAndReset(
           return true;
         }
       }
+
       continue;
     }
 
