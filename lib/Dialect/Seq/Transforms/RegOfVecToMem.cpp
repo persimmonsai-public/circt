@@ -89,6 +89,17 @@ bool RegOfVecToMemPass::analyzeMemoryPattern(FirRegOp reg,
   if (!isArrayType(reg.getType()))
     return false;
 
+  // A register with a reset (or a power-on preset) must NOT become a
+  // seq.firmem: FirMem carries no reset, so the conversion would silently
+  // DROP the array's reset semantics. Concretely: an async-reset register
+  // file reads all-zero after a reset re-assertion in RTL, but the
+  // inferred memory would return whatever was last written -- a real,
+  // SAT-provable mismatch (found via CVA6's fifo_v3 mem_q, which resets
+  // to '0). Leave such arrays as registers; downstream register lowering
+  // handles them correctly.
+  if (reg.getReset() || reg.getPresetAttr())
+    return false;
+
   ArrayGetOp readAccess;
   ArrayInjectOp writeAccess;
   comb::MuxOp writeMux;
