@@ -90,18 +90,29 @@ void Lowering::lower() {
   if (reRootAtWaitDest) {
     auto &region = executeOp.getRegion();
     auto &blocks = region.getBlocks();
+    Block *oldEntry = &blocks.front();
+    Block *newEntry;
     if (waitOp.getDestOperands().empty()) {
       blocks.splice(blocks.begin(), blocks, waitOp.getDest()->getIterator());
+      newEntry = waitOp.getDest();
     } else {
       // The destination needs arguments, so it cannot itself be the entry.
       // Prepend a block that jumps to it with the wait's own destination
       // operands, all of which are defined outside the process.
-      auto *newEntry = new Block();
+      newEntry = new Block();
       blocks.push_front(newEntry);
       OpBuilder entryBuilder(newEntry, newEntry->begin());
       cf::BranchOp::create(entryBuilder, waitOp.getLoc(), waitOp.getDest(),
                            waitOp.getDestOperands());
     }
+    // The old entry is about to become unreachable and be deleted, but it may
+    // still hold ConstantLike ops (the fold interface materializes folder
+    // results there) whose uses in the surviving body would dangle. Move them
+    // to the front of the new entry block, which dominates every reachable
+    // block. ConstantLike ops take no operands, so reordering among
+    // themselves is immaterial.
+    for (auto &op : llvm::make_early_inc_range(oldEntry->without_terminator()))
+      op.moveBefore(newEntry, newEntry->begin());
   }
 
   // Replace the `llhd.wait` with an `llhd.yield`.
@@ -231,6 +242,16 @@ bool Lowering::checkNoValuesLiveAcrossWait() {
   for (auto value : liveness.getLiveOut(waitOp->getBlock())) {
     if (value.getParentRegion()->isProperAncestor(&processOp.getBody()))
       continue;
+    // A constant is not state: it can be rematerialized at any point, so
+    // being "live across" the wait is meaningless for it. Constants now
+    // routinely live INSIDE the process region -- the LLHD fold interface
+    // materializes folder results there so llhd.wait's operands stay
+    // in-region -- and without this exemption every process whose folded
+    // constant is used on both sides of the wait is spuriously refused
+    // (ibex lost 8 modules' worth of processes to exactly that).
+    if (auto *defOp = value.getDefiningOp())
+      if (defOp->hasTrait<OpTrait::ConstantLike>())
+        continue;
     LLVM_DEBUG({
       llvm::dbgs() << "Skipping process " << processOp.getLoc() << ": value ";
       value.print(llvm::dbgs(), OpPrintingFlags().skipRegions());
@@ -290,10 +311,14 @@ bool Lowering::canReRootAtWaitDest() {
       return false;
 
   // The entry block must carry nothing but its branch: once it is unreachable
-  // it gets deleted, and anything it defined would leave dangling uses.
+  // it gets deleted, and anything it defined would leave dangling uses. The
+  // exception is ConstantLike ops -- the LLHD fold interface materializes
+  // folder results inside the region, typically in the entry block -- which
+  // `lower()` moves into the new entry block instead of letting them die.
   auto &entry = processOp.getBody().front();
-  if (!entry.without_terminator().empty())
-    return false;
+  for (auto &op : entry.without_terminator())
+    if (!op.hasTrait<OpTrait::ConstantLike>())
+      return false;
   if (!isa<cf::BranchOp>(entry.getTerminator()))
     return false;
 
