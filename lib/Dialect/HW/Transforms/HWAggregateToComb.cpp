@@ -56,7 +56,11 @@ struct HWAggregateConstantOpConversion
 };
 
 struct HWArrayGetOpConversion : OpConversionPattern<hw::ArrayGetOp> {
-  using OpConversionPattern<hw::ArrayGetOp>::OpConversionPattern;
+  HWArrayGetOpConversion(TypeConverter &typeConverter, MLIRContext *ctx,
+                         unsigned decodedMin)
+      : OpConversionPattern<hw::ArrayGetOp>(typeConverter, ctx),
+        decodedMin(decodedMin) {}
+  unsigned decodedMin;
 
   LogicalResult
   matchAndRewrite(hw::ArrayGetOp op, OpAdaptor adaptor,
@@ -85,6 +89,39 @@ struct HWArrayGetOpConversion : OpConversionPattern<hw::ArrayGetOp> {
     for (size_t i = 0; i < numElements; ++i)
       results.push_back(rewriter.createOrFold<comb::ExtractOp>(
           op.getLoc(), lowered, i * elemWidth, elemWidth));
+
+    // Decoded one-hot select for wide arrays: OR_i (replicate(index == i)
+    // & element_i). The last element also covers out-of-bounds indices
+    // (index >= N-1), matching the mux tree's documented semantics.
+    auto loc = op.getLoc();
+    unsigned idxWidth = index.getType().getIntOrFloatBitWidth();
+    if (decodedMin > 0 && numElements >= decodedMin && idxWidth > 0 &&
+        idxWidth < 64) {
+      uint64_t indexable = 1ull << idxWidth;
+      auto elemTy = rewriter.getIntegerType(elemWidth);
+      SmallVector<Value> terms;
+      for (size_t i = 0; i < numElements; ++i) {
+        if (i >= indexable)
+          break; // unreachable elements
+        Value ci = hw::ConstantOp::create(rewriter, loc, APInt(idxWidth, i));
+        bool last = i + 1 == numElements;
+        Value sel = comb::ICmpOp::create(
+            rewriter, loc,
+            last && indexable > numElements ? comb::ICmpPredicate::uge
+                                            : comb::ICmpPredicate::eq,
+            index, ci, /*twoState=*/true);
+        Value mask = elemWidth == 1
+                         ? sel
+                         : comb::ReplicateOp::create(rewriter, loc, elemTy, sel);
+        terms.push_back(
+            comb::AndOp::create(rewriter, loc, mask, results[i], true));
+      }
+      Value decoded = terms.size() == 1
+                          ? terms.front()
+                          : comb::OrOp::create(rewriter, loc, terms, true);
+      rewriter.replaceOp(op, decoded);
+      return success();
+    }
 
     SmallVector<Value> bits;
     comb::extractBits(rewriter, index, bits);
@@ -353,9 +390,11 @@ public:
 } // namespace
 
 static void populateHWAggregateToCombOpConversionPatterns(
-    RewritePatternSet &patterns, AggregateTypeConverter &typeConverter) {
-  patterns.add<HWArrayGetOpConversion,
-               HWArrayCreateLikeOpConversion<hw::ArrayCreateOp>,
+    RewritePatternSet &patterns, AggregateTypeConverter &typeConverter,
+    unsigned decodedArrayGetMin) {
+  patterns.add<HWArrayGetOpConversion>(typeConverter, patterns.getContext(),
+                                       decodedArrayGetMin);
+  patterns.add<HWArrayCreateLikeOpConversion<hw::ArrayCreateOp>,
                HWArrayCreateLikeOpConversion<hw::ArrayConcatOp>,
                HWAggregateConstantOpConversion, HWArraySliceOpConversion,
                HWArrayInjectOpConversion, HWStructCreateOpConversion,
@@ -402,7 +441,8 @@ void HWAggregateToCombPass::runOnOperation() {
 
   RewritePatternSet patterns(&getContext());
   AggregateTypeConverter typeConverter;
-  populateHWAggregateToCombOpConversionPatterns(patterns, typeConverter);
+  populateHWAggregateToCombOpConversionPatterns(patterns, typeConverter,
+                                               decodedArrayGetMin);
 
   if (failed(mlir::applyPartialConversion(getOperation(), target,
                                           std::move(patterns))))

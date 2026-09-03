@@ -119,7 +119,21 @@ def HWAggregateToComb : Pass<"hw-aggregate-to-comb", "hw::HWModuleOp"> {
     This pass will change the behavior of out-of-bounds access of arrays,
     specifically the last element of the array is used as a value for
     out-of-bounds access.
+
+    Array reads with a dynamic index are lowered as a decoded one-hot
+    AND-OR select (each element ANDed with `index == i`, OR-reduced) when
+    the array has at least `decoded-array-get-min` elements, and as a
+    binary mux tree otherwise. The decoded form is ~2 AIG nodes per
+    element per bit against ~3 for the tree (measured on ibex's 32-entry
+    register file: 1.40x after ABC's dc2, the largest single term of the
+    gate-count gap vs. Yosys, whose $pmux is the decoded form). 0 disables
+    the decoded form.
   }];
+  let options = [
+    Option<"decodedArrayGetMin", "decoded-array-get-min", "unsigned", "8",
+           "Minimum element count for the decoded one-hot array_get "
+           "lowering (0 = always use the mux tree)">,
+  ];
   let dependentDialects = ["comb::CombDialect"];
 }
 
