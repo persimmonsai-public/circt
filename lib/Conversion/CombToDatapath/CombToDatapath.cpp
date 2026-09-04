@@ -48,7 +48,9 @@ struct CombAddOpConversion : OpConversionPattern<AddOp> {
     auto results = datapath::CompressOp::create(rewriter, op.getLoc(),
                                                 op.getOperands(), 2);
     // carry+saved
-    rewriter.replaceOpWithNewOp<AddOp>(op, results.getResults(), true);
+    auto cpa = AddOp::create(rewriter, op.getLoc(), results.getResults(), true);
+    copyAdderArchAttr(op, cpa);
+    rewriter.replaceOp(op, cpa);
     return success();
   }
 };
@@ -68,8 +70,11 @@ struct CombMulOpConversion : OpConversionPattern<MulOp> {
     // Create partial product rows - number of rows == width
     auto pp = datapath::PartialProductOp::create(rewriter, op.getLoc(),
                                                  op.getInputs(), width);
-    // Sum partial products
-    rewriter.replaceOpWithNewOp<AddOp>(op, pp.getResults(), true);
+    // Sum partial products (the multiplier's architecture request, if any,
+    // selects its final carry-propagate adder)
+    auto sum = AddOp::create(rewriter, op.getLoc(), pp.getResults(), true);
+    copyAdderArchAttr(op, sum);
+    rewriter.replaceOp(op, sum);
     return success();
   }
 };

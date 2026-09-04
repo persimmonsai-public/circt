@@ -93,6 +93,15 @@ Value createInject(OpBuilder &builder, Location loc, Value value,
                    unsigned offset, Value replacement);
 
 /// Replace a subtraction with an addition of the two's complement.
+/// Copy the adder-architecture request (`synth.test.arch`, consumed by
+/// CombToSynth's determineAdderArch) from an op being lowered onto the
+/// carry-propagate adder that replaces it, so a sub, a variadic add or a
+/// multiplier keeps the architecture chosen for it.
+inline void copyAdderArchAttr(mlir::Operation *from, mlir::Operation *to) {
+  if (auto a = from->getAttr("synth.test.arch"))
+    to->setAttr("synth.test.arch", a);
+}
+
 LogicalResult convertSubToAdd(comb::SubOp subOp,
                               mlir::PatternRewriter &rewriter);
 

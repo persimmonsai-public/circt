@@ -1052,6 +1052,7 @@ struct CombMulOpConversion : OpConversionPattern<MulOp> {
 
     // Sum the two addends using a carry-propagate adder
     auto newAdd = comb::AddOp::create(rewriter, loc, addends, true);
+    comb::copyAdderArchAttr(op, newAdd);
     replaceOpAndCopyNamehint(rewriter, op, newAdd);
     return success();
   }

@@ -265,8 +265,11 @@ llvm::LogicalResult comb::convertSubToAdd(comb::SubOp subOp,
       comb::createOrFoldNot(rewriter, subOp.getLoc(), rhs, subOp.getTwoState());
   auto one =
       hw::ConstantOp::create(rewriter, subOp.getLoc(), subOp.getType(), 1);
-  replaceOpWithNewOpAndCopyNamehint<comb::AddOp>(
-      rewriter, subOp, ValueRange{lhs, notRhs, one}, subOp.getTwoState());
+  auto add = comb::AddOp::create(rewriter, subOp.getLoc(),
+                                 ValueRange{lhs, notRhs, one},
+                                 subOp.getTwoState());
+  copyAdderArchAttr(subOp, add);
+  replaceOpAndCopyNamehint(rewriter, subOp, add);
   return success();
 }
 

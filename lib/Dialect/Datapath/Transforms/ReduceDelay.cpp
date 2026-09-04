@@ -61,8 +61,10 @@ struct FoldAddReplicate : public OpRewritePattern<comb::AddOp> {
                                                       newCompressOperands, 2);
 
     // Add the results of the CompressOp
-    rewriter.replaceOpWithNewOp<comb::AddOp>(addOp, newCompressOp.getResults(),
-                                             true);
+    auto cpa = comb::AddOp::create(rewriter, addOp.getLoc(),
+                                   newCompressOp.getResults(), true);
+    comb::copyAdderArchAttr(addOp, cpa);
+    rewriter.replaceOp(addOp, cpa);
     return success();
   }
 };
@@ -133,8 +135,10 @@ struct FoldMuxAdd : public OpRewritePattern<comb::AddOp> {
                                                       newCompressOperands, 2);
 
     // Add the results of the CompressOp
-    rewriter.replaceOpWithNewOp<comb::AddOp>(addOp, newCompressOp.getResults(),
-                                             true);
+    auto cpa = comb::AddOp::create(rewriter, addOp.getLoc(),
+                                   newCompressOp.getResults(), true);
+    comb::copyAdderArchAttr(addOp, cpa);
+    rewriter.replaceOp(addOp, cpa);
     return success();
   }
 };
