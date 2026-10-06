@@ -433,6 +433,17 @@ struct CombMuxOpToSynthConversion : OpConversionPattern<MuxOp> {
     Value trueVal = adaptor.getTrueValue();
     Value falseVal = adaptor.getFalseValue();
 
+    // A zero-width value has exactly one value: the mux is that constant.
+    // (Replicating the i1 condition to i0 below would be invalid.)
+    if (hw::getBitWidth(op.getType()) == 0) {
+      Value zero = hw::ConstantOp::create(rewriter, op.getLoc(),
+                                         APInt(/*numBits=*/0u, /*val=*/0ull));
+      if (zero.getType() != op.getType())
+        zero = hw::BitcastOp::create(rewriter, op.getLoc(), op.getType(), zero);
+      replaceOpAndCopyNamehint(rewriter, op, zero);
+      return success();
+    }
+
     if (!op.getType().isInteger()) {
       auto widthType = rewriter.getIntegerType(hw::getBitWidth(op.getType()));
       trueVal =
