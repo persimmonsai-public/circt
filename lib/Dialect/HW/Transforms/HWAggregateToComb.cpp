@@ -341,6 +341,80 @@ struct HWStructInjectOpConversion : OpConversionPattern<hw::StructInjectOp> {
   }
 };
 
+/// Bit position of a union member's LSB within the flattened union. The
+/// member's `offset` counts from the MSB, as ExportVerilog lays a member out:
+/// `struct packed { pre_padding[offset]; member; post_padding }`. A member as
+/// wide as the union (every SV hard packed union) covers it entirely.
+static std::optional<int64_t> unionMemberLsb(hw::UnionType type,
+                                             unsigned index) {
+  auto field = type.getElements()[index];
+  int64_t total = hw::getBitWidth(type);
+  int64_t width = hw::getBitWidth(field.type);
+  if (total < 0 || width < 0 || (int64_t)field.offset + width > total)
+    return std::nullopt;
+  return total - (int64_t)field.offset - width;
+}
+
+/// hw.union_create: the member's bits at its position, the rest zero (the
+/// union's other bits are undefined, so any value is a valid refinement).
+struct HWUnionCreateOpConversion : OpConversionPattern<hw::UnionCreateOp> {
+  using OpConversionPattern<hw::UnionCreateOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(hw::UnionCreateOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto type = hw::type_cast<hw::UnionType>(op.getType());
+    auto lsb = unionMemberLsb(type, op.getFieldIndex());
+    if (!lsb)
+      return rewriter.notifyMatchFailure(op.getLoc(), "unknown union layout");
+    int64_t total = hw::getBitWidth(type);
+    Value member = adaptor.getInput();
+    int64_t width = hw::getBitWidth(member.getType());
+    if (!isa<IntegerType>(member.getType()))
+      member = hw::BitcastOp::create(rewriter, op.getLoc(),
+                                     rewriter.getIntegerType(width), member);
+    SmallVector<Value, 3> parts;
+    int64_t high = total - *lsb - width;
+    if (high > 0)
+      parts.push_back(hw::ConstantOp::create(rewriter, op.getLoc(),
+                                             APInt::getZero(high)));
+    parts.push_back(member);
+    if (*lsb > 0)
+      parts.push_back(hw::ConstantOp::create(rewriter, op.getLoc(),
+                                             APInt::getZero(*lsb)));
+    Value result = parts.size() == 1
+                       ? parts.front()
+                       : comb::ConcatOp::create(rewriter, op.getLoc(), parts)
+                             .getResult();
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+/// hw.union_extract: the member's bit range of the flattened union.
+struct HWUnionExtractOpConversion : OpConversionPattern<hw::UnionExtractOp> {
+  using OpConversionPattern<hw::UnionExtractOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(hw::UnionExtractOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto type = hw::type_cast<hw::UnionType>(op.getInput().getType());
+    auto lsb = unionMemberLsb(type, op.getFieldIndex());
+    if (!lsb)
+      return rewriter.notifyMatchFailure(op.getLoc(), "unknown union layout");
+    Type resTy = getTypeConverter()->convertType(op.getType());
+    int64_t width = hw::getBitWidth(op.getType());
+    Value bits = adaptor.getInput();
+    if (width != hw::getBitWidth(type))   // a full-width member is the union
+      bits = comb::ExtractOp::create(rewriter, op.getLoc(),
+                                     rewriter.getIntegerType(width), bits, *lsb);
+    if (resTy != bits.getType())
+      bits = hw::BitcastOp::create(rewriter, op.getLoc(), resTy, bits);
+    rewriter.replaceOp(op, bits);
+    return success();
+  }
+};
+
 struct MuxOpConversion : OpConversionPattern<comb::MuxOp> {
   using OpConversionPattern<comb::MuxOp>::OpConversionPattern;
 
@@ -364,6 +438,9 @@ public:
       return IntegerType::get(t.getContext(), hw::getBitWidth(t));
     });
     addConversion([](hw::StructType t) -> Type {
+      return IntegerType::get(t.getContext(), hw::getBitWidth(t));
+    });
+    addConversion([](hw::UnionType t) -> Type {
       return IntegerType::get(t.getContext(), hw::getBitWidth(t));
     });
     addTargetMaterialization([](mlir::OpBuilder &builder, mlir::Type resultType,
@@ -399,6 +476,7 @@ static void populateHWAggregateToCombOpConversionPatterns(
                HWAggregateConstantOpConversion, HWArraySliceOpConversion,
                HWArrayInjectOpConversion, HWStructCreateOpConversion,
                HWStructExtractOpConversion, HWStructInjectOpConversion,
+               HWUnionCreateOpConversion, HWUnionExtractOpConversion,
                MuxOpConversion>(
       typeConverter, patterns.getContext());
 }
@@ -432,7 +510,8 @@ void HWAggregateToCombPass::runOnOperation() {
                                hw::ArrayConcatOp, hw::AggregateConstantOp,
                                hw::ArrayInjectOp, hw::ArraySliceOp,
                                hw::StructCreateOp, hw::StructExtractOp,
-                               hw::StructInjectOp>(
+                               hw::StructInjectOp, hw::UnionCreateOp,
+                               hw::UnionExtractOp>(
       [](Operation *op) { return isInsideLLHDRegion(op); });
   target.addDynamicallyLegalOp<comb::MuxOp>([](comb::MuxOp op) {
     return hw::type_isa<IntegerType>(op.getType()) || isInsideLLHDRegion(op);
