@@ -2951,6 +2951,25 @@ Value Context::materializeFixedSizeUnpackedArrayType(
     return moore::ArrayCreateOp::create(builder, loc, arrayType, elemVals);
   }
 
+  // Nested unpacked arrays (e.g. `int unsigned Map [N][2]`): materialize
+  // each element recursively and build the outer array from them.
+  if (auto *inner = astType.elementType.getCanonicalType()
+                        .as_if<slang::ast::FixedSizeUnpackedArrayType>()) {
+    SmallVector<Value> elemVals;
+    for (const auto &elem : constant.elements()) {
+      auto value = materializeFixedSizeUnpackedArrayType(elem, *inner, loc);
+      if (!value)
+        return {};
+      elemVals.push_back(value);
+    }
+    if (elemVals.empty())
+      return {};
+    auto arrType = moore::UnpackedArrayType::get(
+        getContext(), elemVals.size(),
+        cast<moore::UnpackedType>(elemVals.front().getType()));
+    return moore::ArrayCreateOp::create(builder, loc, arrType, elemVals);
+  }
+
   // Check whether underlying type is an integer, if so, get bit width
   unsigned bitWidth;
   if (astType.elementType.isIntegral())
