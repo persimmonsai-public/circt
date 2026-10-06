@@ -64,6 +64,17 @@ hw.module @mux(in %cond: i1, in %high: !hw.array<2xi4>, in %low: !hw.array<2xi4>
   hw.output %0 : !hw.array<2xi4>
 }
 
+// A zero-width mux has a single possible value; it lowers to a constant
+// instead of replicating the condition to i0.
+// CHECK-LABEL: @mux_zero_width
+// CHECK-NOT: comb.replicate
+// CHECK-NOT: comb.mux
+// CHECK: hw.constant 0 : i0
+hw.module @mux_zero_width(in %cond: i1, in %a: i0, in %b: i0, out out: i0) {
+  %0 = comb.mux %cond, %a, %b : i0
+  hw.output %0 : i0
+}
+
 // CHECK-LABEL: func.func @parity
 func.func @parity(%arg0: i4) -> i1 {
   // CHECK-NOT: comb.parity
