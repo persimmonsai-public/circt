@@ -295,8 +295,103 @@ std::unique_ptr<mlir::Pass> circt::moore::createSimplifyRefsPass() {
   return std::make_unique<SimplifyRefsPass>();
 }
 
+/// The value read through `ref`: a read, or for a concatenation of
+/// references the concatenation of the reads of its parts.
+static Value readThrough(OpBuilder &builder, Location loc, Value ref) {
+  if (auto concat = ref.getDefiningOp<ConcatRefOp>()) {
+    SmallVector<Value> parts;
+    for (auto part : concat.getValues())
+      parts.push_back(readThrough(builder, loc, part));
+    return ConcatOp::create(builder, loc, parts);
+  }
+  return ReadOp::create(builder, loc, ref);
+}
+
+/// Reading a concatenation of references (a compound assignment to a
+/// concatenation, `{a, b} &= e`, reads its left-hand side back) is the
+/// concatenation of the reads. Rewrite those reads first, so the assignments
+/// below see `concat_ref` only as their destination.
+static void lowerReadsOfConcatRefs(Operation *root) {
+  SmallVector<ReadOp> reads;
+  root->walk([&](ReadOp read) {
+    if (read.getInput().getDefiningOp<ConcatRefOp>())
+      reads.push_back(read);
+  });
+  for (auto read : reads) {
+    OpBuilder builder(read);
+    read.replaceAllUsesWith(
+        readThrough(builder, read.getLoc(), read.getInput()));
+    read.erase();
+  }
+}
+
+/// A dynamic part-select of a packed struct reference (`s[i*W +: W]`, legal
+/// on any packed type) has no LLHD signal projection. Rewrite its reads as a
+/// dyn_extract of the struct's bit vector, and its blocking assignments as a
+/// read-modify-write of the whole struct through that bit vector.
+///
+/// Only blocking assignments: a read-modify-write of a non-blocking
+/// assignment would read the struct's current value, so of two non-blocking
+/// part-selects in one block the second would undo the first. Those (and any
+/// other use) are left alone and still fail to legalize.
+static void lowerDynExtractRefsOfStructs(Operation *root) {
+  SmallVector<DynExtractRefOp> refs;
+  root->walk([&](DynExtractRefOp op) {
+    if (isa<StructType>(cast<RefType>(op.getInput().getType()).getNestedType()))
+      refs.push_back(op);
+  });
+  for (auto ref : refs) {
+    Value whole = ref.getInput();
+    auto structTy =
+        cast<PackedType>(cast<RefType>(whole.getType()).getNestedType());
+    auto sbvTy = dyn_cast_or_null<IntType>(structTy.getSimpleBitVector());
+    auto partTy =
+        dyn_cast<IntType>(cast<RefType>(ref.getType()).getNestedType());
+    if (!sbvTy || !partTy || partTy.getDomain() != sbvTy.getDomain() ||
+        partTy.getWidth() > sbvTy.getWidth())
+      continue;
+    unsigned n = sbvTy.getWidth(), w = partTy.getWidth();
+    for (Operation *user : llvm::make_early_inc_range(ref->getUsers())) {
+      OpBuilder b(user);
+      Location loc = user->getLoc();
+      auto bits = [&]() -> Value {
+        Value v = ReadOp::create(b, loc, whole);
+        return PackedToSBVOp::create(b, loc, v);
+      };
+      if (auto read = dyn_cast<ReadOp>(user)) {
+        Value part =
+            DynExtractOp::create(b, loc, partTy, bits(), ref.getLowBit());
+        read.replaceAllUsesWith(part);
+        read.erase();
+        continue;
+      }
+      auto assign = dyn_cast<BlockingAssignOp>(user);
+      if (!assign || assign.getDst() != ref.getResult() ||
+          assign.getSrc().getType() != partTy)
+        continue;
+      Value old = bits();
+      Value mask =
+          ConstantOp::create(b, loc, sbvTy, FVInt(APInt::getLowBitsSet(n, w)));
+      Value amount = ref.getLowBit();
+      Value hole = NotOp::create(b, loc, ShlOp::create(b, loc, mask, amount));
+      Value src = assign.getSrc();
+      Value wide =
+          w == n ? src : ZExtOp::create(b, loc, sbvTy, src).getResult();
+      Value merged = OrOp::create(b, loc, AndOp::create(b, loc, old, hole),
+                                  ShlOp::create(b, loc, wide, amount));
+      assign.getDstMutable().assign(whole);
+      assign.getSrcMutable().assign(
+          SBVToPackedOp::create(b, loc, structTy, merged));
+    }
+    if (ref->use_empty())
+      ref.erase();
+  }
+}
+
 void SimplifyRefsPass::runOnOperation() {
   MLIRContext &context = getContext();
+  lowerReadsOfConcatRefs(getOperation());
+  lowerDynExtractRefsOfStructs(getOperation());
   ConversionTarget target(context);
 
   target.addDynamicallyLegalOp<ContinuousAssignOp, BlockingAssignOp,
