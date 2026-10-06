@@ -252,8 +252,14 @@ SignalSlice ModuleContext::traceProjectionImpl(Value value) {
   }
 
   if (auto op = value.getDefiningOp<SigStructExtractOp>()) {
-    auto structType = hw::type_cast<hw::StructType>(
+    // A member of a packed union aliases the whole union (every member starts
+    // at bit 0), so it is not a disjoint field of an aggregate. Leave it
+    // untraced: its drives then count as unknown uses of the parent signal,
+    // which keeps the parent from being completed with default values.
+    auto structType = hw::type_dyn_cast<hw::StructType>(
         cast<RefType>(op.getInput().getType()).getNestedType());
+    if (!structType)
+      return {};
     auto input = traceProjection(op.getInput());
     if (!input)
       return {};

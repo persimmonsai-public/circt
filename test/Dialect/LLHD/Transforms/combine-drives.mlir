@@ -315,3 +315,25 @@ hw.module @SkipGapsOnUnknownUse(in %u: i42) {
 }
 
 func.func private @useSigI42(%arg0: !llhd.ref<i42>)
+
+// Drives to members of packed-union array elements: a union member aliases
+// the whole union, so it is left untraced (no crash), the member drives stay,
+// and the parent is not completed with its default value.
+// CHECK-LABEL: @UnionMemberDrives
+hw.module @UnionMemberDrives(in %i0 : !hw.struct<a: i4, b: i4>, in %i1 : i8) {
+  %true = hw.constant true
+  %false = hw.constant false
+  %t = llhd.constant_time <0ns, 0d, 1e>
+  %c0_i16 = hw.constant 0 : i16
+  %init = hw.bitcast %c0_i16 : (i16) -> !hw.array<2xunion<x: !hw.struct<a: i4, b: i4>, y: i8>>
+  %o = llhd.sig %init : !hw.array<2xunion<x: !hw.struct<a: i4, b: i4>, y: i8>>
+  %e0 = llhd.sig.array_get %o[%false] : <!hw.array<2xunion<x: !hw.struct<a: i4, b: i4>, y: i8>>>
+  %x = llhd.sig.struct_extract %e0["x"] : <!hw.union<x: !hw.struct<a: i4, b: i4>, y: i8>>
+  // CHECK: llhd.drv {{%.+}}, %i0
+  llhd.drv %x, %i0 after %t : !hw.struct<a: i4, b: i4>
+  %e1 = llhd.sig.array_get %o[%true] : <!hw.array<2xunion<x: !hw.struct<a: i4, b: i4>, y: i8>>>
+  %y = llhd.sig.struct_extract %e1["y"] : <!hw.union<x: !hw.struct<a: i4, b: i4>, y: i8>>
+  // CHECK: llhd.drv {{%.+}}, %i1
+  llhd.drv %y, %i1 after %t : i8
+  hw.output
+}

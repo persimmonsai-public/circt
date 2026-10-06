@@ -825,9 +825,28 @@ public:
                   [&](llhd::SigStructExtractOp structOp) {
                     if (!offset.isStatic())
                       return failure();
-                    auto structTy = hw::type_cast<hw::StructType>(
-                        cast<llhd::RefType>(structOp.getInput().getType())
-                            .getNestedType());
+                    auto nested = cast<llhd::RefType>(structOp.getInput().getType())
+                                      .getNestedType();
+                    // A packed-union member as wide as the union (a hard
+                    // packed union: every SV packed union) covers the whole
+                    // union, so it adds no offset. A narrower or offset member
+                    // (placed from the MSB, as ExportVerilog pads it) is
+                    // declined, not guessed.
+                    if (auto unionTy = hw::type_dyn_cast<hw::UnionType>(nested)) {
+                      if (!unionTy.getFieldIndex(structOp.getFieldAttr()))
+                        return failure();
+                      auto field =
+                          unionTy.getFieldInfo(structOp.getFieldAttr().getValue());
+                      if (field.offset != 0 ||
+                          hw::getBitWidth(field.type) != hw::getBitWidth(unionTy))
+                        return failure();
+                      for (auto *user : structOp->getUsers())
+                        stack.emplace_back(user, offset);
+                      return success();
+                    }
+                    auto structTy = hw::type_dyn_cast<hw::StructType>(nested);
+                    if (!structTy)
+                      return failure();
                     auto index = structTy.getFieldIndex(structOp.getFieldAttr());
                     if (!index)
                       return failure();

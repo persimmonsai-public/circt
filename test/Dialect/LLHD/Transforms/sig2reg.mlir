@@ -180,3 +180,29 @@ hw.module @RemoveDriveOnlySignals(in %d: i42, in %e: i1) {
   llhd.drv %b, %d after %1 if %e : i42
   // CHECK: hw.output
 }
+
+// Packed-union members start at the union's bit 0: drives to members of two
+// array elements are promoted with element 0 in the low bits.
+// CHECK-LABEL: @UnionMembersPromoted
+// CHECK-NOT: llhd.sig
+// CHECK: [[X:%.+]] = hw.bitcast %i0 : (!hw.struct<a: i4, b: i4>) -> i8
+// CHECK: comb.concat %c0_i8, [[X]] : i8, i8
+// CHECK: [[C8:%.+]] = hw.constant 8 : i16
+// CHECK: [[Y:%.+]] = comb.concat %c0_i8, %i1 : i8, i8
+// CHECK: comb.shl [[Y]], [[C8]] : i16
+hw.module @UnionMembersPromoted(in %i0 : !hw.struct<a: i4, b: i4>, in %i1 : i8, out o : !hw.array<2xunion<x: !hw.struct<a: i4, b: i4>, y: i8>>) {
+  %true = hw.constant true
+  %false = hw.constant false
+  %t = llhd.constant_time <0ns, 0d, 1e>
+  %c0_i16 = hw.constant 0 : i16
+  %init = hw.bitcast %c0_i16 : (i16) -> !hw.array<2xunion<x: !hw.struct<a: i4, b: i4>, y: i8>>
+  %o = llhd.sig %init : !hw.array<2xunion<x: !hw.struct<a: i4, b: i4>, y: i8>>
+  %e0 = llhd.sig.array_get %o[%false] : <!hw.array<2xunion<x: !hw.struct<a: i4, b: i4>, y: i8>>>
+  %x = llhd.sig.struct_extract %e0["x"] : <!hw.union<x: !hw.struct<a: i4, b: i4>, y: i8>>
+  llhd.drv %x, %i0 after %t : !hw.struct<a: i4, b: i4>
+  %e1 = llhd.sig.array_get %o[%true] : <!hw.array<2xunion<x: !hw.struct<a: i4, b: i4>, y: i8>>>
+  %y = llhd.sig.struct_extract %e1["y"] : <!hw.union<x: !hw.struct<a: i4, b: i4>, y: i8>>
+  llhd.drv %y, %i1 after %t : i8
+  %p = llhd.prb %o : !hw.array<2xunion<x: !hw.struct<a: i4, b: i4>, y: i8>>
+  hw.output %p : !hw.array<2xunion<x: !hw.struct<a: i4, b: i4>, y: i8>>
+}
